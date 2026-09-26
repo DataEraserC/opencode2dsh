@@ -12,8 +12,10 @@ import { buildStatusView, isTrustedBridgeRequest, makeBridgeHandlers, makeBridge
 
 // -- namespace ---------------------------------------------------------------
 
-test('ip-pool namespace is kebab-case branded name', () => {
-  assert.equal(String(IP_POOL_NAMESPACE), 'ip-pool')
+test('ip-pool settings are served under the Loader entry id', () => {
+  // DSH 0.1.7 derives the namespace from the loader entry, so it is
+  // 'opencode2dsh' — not a name the plugin registers for itself.
+  assert.equal(String(IP_POOL_NAMESPACE), 'opencode2dsh')
 })
 
 test('schema fills every default from an empty section', () => {
@@ -47,6 +49,7 @@ test('toIpPoolConfig maps the settings value onto the plugin config shape', () =
     manual: ['http://1.2.3.4:8080'],
     pinnedExitId: 'http://127.0.0.1:7897',
     pinnedStrict: true,
+    maxConcurrentProbes: 7,
     subscription: { urls: ['https://sub.example.com/token'], refreshMs: 123_456 },
   }) as never)
   assert.equal(mapped.enabled, true)
@@ -56,6 +59,11 @@ test('toIpPoolConfig maps the settings value onto the plugin config shape', () =
   assert.deepEqual(mapped.subscriptions, ['https://sub.example.com/token'])
   assert.deepEqual(mapped.probeModels, ['big-pickle'])
   assert.deepEqual(mapped.singbox, { path: 'sing-box' })
+  // The runtime reads these two off the config shape (ip-pool.ts:
+  // Prober construction + SubscriptionFetcher interval), so dropping them here
+  // would reset them to the default on every live commit.
+  assert.equal(mapped.maxConcurrentProbes, 7)
+  assert.deepEqual(mapped.subscription, { refreshMs: 123_456 })
 })
 
 // -- bridge: status view -------------------------------------------------------

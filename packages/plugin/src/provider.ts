@@ -36,25 +36,59 @@ export function providerBaseURL(port: number): string {
  * mode serves the provider id itself; a stale route pointing at a dead
  * sidecar port would shadow dispatch and fail every call with a connection
  * error. Returns true when a route was actually removed.
+ *
+ * DSH 0.1.7 dropped the per-namespace `get(ns)` reader: `SettingsForms` serves
+ * every declared namespace from one `describe()` call, keyed by entry id, so
+ * the read is a lookup in that list. The 0.1.1 `get` is still tried first for a
+ * host that has not moved.
  */
 export async function removeProviderRoute(
   seams: Pick<DshSeams, 'settings'>,
   providerId: string,
 ): Promise<boolean> {
-  const namespace = seams.settings.get('llm-pi-ai') as { providers?: Record<string, unknown> } | undefined
+  const namespace = readNamespace(seams.settings, 'llm-pi-ai') as { providers?: Record<string, unknown> } | undefined
   if (!namespace?.providers || !(providerId in namespace.providers)) return false
+  if (typeof seams.settings.mutate !== 'function') return false
   await seams.settings.mutate('llm-pi-ai', [{ op: 'unset', path: ['providers', providerId] }])
   return true
 }
 
-/** Minimal settings/credentials seam so tests can run against fakes. */
+/**
+ * One namespace's resolved value, from whichever read face the host offers.
+ * 0.1.7's `describe()` is preferred: it is the canonical face and the only one
+ * a 0.1.7 host has, and preferring it means a reduced composition that still
+ * carries a vestigial `get` is never routed through it.
+ */
+function readNamespace(settings: DshSeams['settings'], ns: string): unknown {
+  if (typeof settings.describe === 'function') {
+    const descriptors = settings.describe()
+    if (Array.isArray(descriptors)) {
+      for (const descriptor of descriptors) {
+        const row = descriptor as { ns?: string; value?: unknown }
+        if (row?.ns === ns) return row.value
+      }
+    }
+  }
+  if (typeof settings.get === 'function') return settings.get(ns)
+  return undefined
+}
+
+/**
+ * Minimal settings/credentials seam so tests can run against fakes.
+ *
+ * `mutate` is optional because DSH 0.1.7's `SettingsForms` always has it while
+ * a reduced composition (and the sidecar's degraded fallback) may not; every
+ * caller checks before writing rather than throwing on a missing writer.
+ * The read face is `describe()` on 0.1.7, with 0.1.1's `get(ns)` tolerated.
+ */
 export interface DshSeams {
   credentials: {
     set(ref: string, value: string): Promise<void>
   }
   settings: {
-    get(ns: string): unknown
-    mutate(ns: string, ops: Array<{ op: 'set' | 'unset'; path: Array<string | number>; value?: unknown }>): Promise<void>
+    describe?(options?: { redactSecrets?: boolean }): unknown
+    get?(ns: string): unknown
+    mutate?(ns: string, ops: Array<{ op: 'set' | 'unset'; path: Array<string | number>; value?: unknown }>, expectedRevision?: number): Promise<void>
   }
   logger: { info(message: string): void; warn(message: string): void }
 }
@@ -121,6 +155,10 @@ export async function registerProvider(
   models: PiAiModelEntry[],
 ): Promise<void> {
   await seams.credentials.set(target.apiKeyEnv, token)
+  if (typeof seams.settings.mutate !== 'function') {
+    seams.logger.warn('opencode2dsh: settings seam lacks mutate; the sidecar provider route cannot be published')
+    return
+  }
 
   const route = {
     displayName: 'opencode2dsh',

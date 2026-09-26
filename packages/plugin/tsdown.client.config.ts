@@ -1,10 +1,9 @@
 /**
  * Standalone tsdown config for the opencode2dsh client bundle (docs/ip-pool.md
- * §5.4) — mirrors dsh-llm-proxy's validated chain, adapted to the rc.2
- * platform seeds verified on this host (web-frontend static table):
- * react, react/jsx-runtime, react-dom, react-dom/client, @deepseek-ai/cordis,
- * @deepseek-ai/dsh-client-ui-slots, @deepseek-ai/dsh-client-ui-primitives,
- * plus the @deepseek-ai/dsh-client-runtime/client preload graph row.
+ * §5.4) — mirrors dsh-llm-proxy's validated chain, adapted to the platform
+ * seeds verified on this host (web-frontend static table): react,
+ * react/jsx-runtime, react-dom, react-dom/client, @deepseek-ai/cordis,
+ * @deepseek-ai/dsh-client-ui-slots, @deepseek-ai/dsh-client-ui-primitives.
  *
  * Emits a closure-factory artifact into lib/client.js that calls
  * window.__ModuleLoader__.load({ id, factory }) and resolves its externals
@@ -23,8 +22,8 @@ const ID = '@opencode2dsh/dsh-plugin'
 
 /**
  * Browser platform modules the shell seeds into the frozen module table
- * (rc.2 host, verified in the web-frontend dist kernel table). Every
- * specifier here is an external answered by the loader at runtime.
+ * (host-verified in the web-frontend dist kernel table). Every specifier here
+ * is an external answered by the loader at runtime.
  */
 export const PLATFORM_MODULES = [
   'react', 'react/jsx-runtime', 'react-dom', 'react-dom/client', '@deepseek-ai/cordis',
@@ -32,11 +31,14 @@ export const PLATFORM_MODULES = [
   '@deepseek-ai/dsh-client-ui-primitives',
 ] as const
 
-/** Preload graph row (client-runtime is preloaded, not a static seed). */
-const RUNTIME_STORE_EXEMPTION = '@deepseek-ai/dsh-client-runtime/client'
-
-/** Externals resolved from the loader module table. */
-export const CLIENT_EXTERNALS: readonly string[] = [...PLATFORM_MODULES, RUNTIME_STORE_EXEMPTION]
+/**
+ * Externals resolved from the loader module table.
+ *
+ * The client half reaches other DSH packages only through cordis services
+ * (`slots`, `locale`, `configForms`), so nothing else qualifies: the settings
+ * provider is reached by service injection, not by importing its bundle.
+ */
+export const CLIENT_EXTERNALS: readonly string[] = [...PLATFORM_MODULES]
 
 /** Virtual-id wrapper keeping module CSS away from tsdown's own css pipeline. */
 const CSS_VIRTUAL_PREFIX = '\0dsh-css:'
