@@ -94,16 +94,14 @@ export const zh = {
   save: '保存',
   saving: '保存中…',
   saved: '已保存，立即生效',
-  reset: '恢复默认',
   saveError: '保存失败',
+  readOnly: '当前配置为只读，无法保存修改。',
   invalidRange: '数值超出允许范围。',
   invalidProxy: '代理地址格式应为 http://host:port 或 socks5://host:port。',
   invalidUrl: '请填写合法的 http(s) URL。',
   invalidCountry: '国家码应为两个字母（如 CN），逗号分隔。',
   invalidModel: '模型 id 不能为空。',
   refreshError: '状态获取失败',
-  expand: '展开',
-  collapse: '收起',
 } as const
 
 /** English dictionary, checked complete against the zh key set. */
@@ -197,16 +195,14 @@ export const en: Record<keyof typeof zh, string> = {
   save: 'Save',
   saving: 'Saving…',
   saved: 'Saved, applied live',
-  reset: 'Reset to defaults',
   saveError: 'Save failed',
+  readOnly: 'This configuration is read-only; changes cannot be saved.',
   invalidRange: 'A value is out of range.',
   invalidProxy: 'Expected http://host:port or socks5://host:port.',
   invalidUrl: 'Enter a valid http(s) URL.',
   invalidCountry: 'Country codes are two letters (e.g. CN), comma-separated.',
   invalidModel: 'Model id must not be empty.',
   refreshError: 'Status fetch failed',
-  expand: 'Expand',
-  collapse: 'Collapse',
 }
 
 export type IpPoolKey = keyof typeof zh

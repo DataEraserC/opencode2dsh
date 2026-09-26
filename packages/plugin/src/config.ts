@@ -3,6 +3,10 @@ import { chmod, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/pro
 import { dirname, join } from 'node:path'
 import { platform } from 'node:process'
 
+import Schema from '@deepseek-ai/schemastery'
+
+import { IpPoolConfigSchema, type IpPoolSettings, type VolatileRef } from './ip-pool-settings/namespace.ts'
+
 /**
  * Plugin configuration (cordis config object, injected via cordis.patch.yml).
  */
@@ -92,6 +96,73 @@ export type ResolvedConfig = Required<
 
 export function resolveConfig(config: Opencode2dshConfig = {}): ResolvedConfig {
   return { ...defaults, ...config }
+}
+
+/**
+ * The plugin's `Config` — the whole DSH settings contract in one schema.
+ *
+ * DSH 0.1.7 has no imperative `ctx.settings.register(ns, schema)`. A plugin
+ * declares editable settings by exporting this schema, and dsh-settings derives
+ * the served namespace from the Loader entry id. Two consequences drive this
+ * shape:
+ *
+ *  - `ipPool` is ONE `.volatile()` node, so the entire ip-pool subtree is the
+ *    settings form (dsh-settings' `volatileForm()` selects a node's whole plain
+ *    schema once that node is volatile). Nesting `.volatile()` deeper is a hard
+ *    schemastery error, and per-field marks would also fragment the card's
+ *    form value into siblings instead of one `ipPool` object.
+ *  - every other field is ORDINARY configuration. `volatileForm()` drops it
+ *    from the form, which is the intent: these are set by the composition
+ *    (`cordis.patch.yml`) or a hand-edited profile patch, never by the card.
+ *
+ * The reference is `dsh-llm-deepseek`'s `deepSeekConfigFields`.
+ */
+export const Config = Schema.object({
+  /** Integration mode; `adapter` (default) is the shipped shape. */
+  mode: Schema.union(['adapter', 'sidecar']).default('adapter'),
+  /** Path to the agent binary (sidecar mode only; not bundled). */
+  agentPath: Schema.string(),
+  /** Extra CLI args forwarded to the agent (after --config). */
+  agentArgs: Schema.array(Schema.string()).default([]),
+  /** Provider route name registered into llm-pi-ai settings (sidecar mode). */
+  providerId: Schema.string().default(defaults.providerId),
+  /** Credential reference (env var name) holding the local agent token. */
+  apiKeyEnv: Schema.string().default(defaults.apiKeyEnv),
+  /** Model list refresh interval in seconds. */
+  refreshSeconds: Schema.number().step(1).min(1).default(defaults.refreshSeconds),
+  /** Restart backoff: initial delay ms. */
+  restartDelayMs: Schema.number().step(1).min(0).default(defaults.restartDelayMs),
+  /** Restart backoff: max delay ms. */
+  restartMaxDelayMs: Schema.number().step(1).min(0).default(defaults.restartMaxDelayMs),
+  /** Consecutive crash count that trips the circuit breaker. */
+  maxConsecutiveCrashes: Schema.number().step(1).min(0).default(defaults.maxConsecutiveCrashes),
+  /** The ip-pool settings form (docs/ip-pool.md §5.1); served as this entry. */
+  ipPool: IpPoolConfigSchema.volatile(),
+})
+
+/**
+ * What `apply()` receives once the Loader has resolved {@link Config}.
+ *
+ * `ipPool` is a STABLE reference, not a value: the Loader commits a settings
+ * save into the same object and announces it with `loader/volatile-update`, so
+ * consumers read `.get()` at the moment they need a snapshot and never cache
+ * the object it returned.
+ */
+export interface ResolvedPluginConfig extends Omit<ResolvedConfig, 'ipPool'> {
+  ipPool: VolatileRef<IpPoolSettings>
+}
+
+/** Every field except the volatile ip-pool reference. */
+export type OrdinaryPluginConfig = Omit<ResolvedPluginConfig, 'ipPool'>
+
+/**
+ * The ordinary half of a resolved config, for the call sites that reconfigure
+ * the pool runtime and need a plain object. Spreading the whole config instead
+ * would hand `startIpPool` the volatile reference where it expects values.
+ */
+export function ordinaryConfig(config: ResolvedPluginConfig): OrdinaryPluginConfig {
+  const { ipPool: _ipPool, ...ordinary } = config
+  return ordinary
 }
 
 /**
