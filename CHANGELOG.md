@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.4 (2026-09-19)
+
+### Fixed
+
+- **DSH 0.1.7-alpha.1 及以后插件不再卡在「不激活」。** 新版 DSH 移除了客户端的
+  `settingsScope` 服务，而插件仍把它列为启动依赖，于是网页端一直报
+  `pending (waiting for service: settingsScope)`，插件整体挂起、设置页卡片
+  看不到（用户反馈 issue #20）。现在改为向设置域提供的 `configForms` 服务索取
+  本插件自己的 namespace 表单，注入令牌与代码同步更新。IP 池设置卡片的读写、
+  保存与重置行为不变。
+
 ## 0.3.3 (2026-09-18)
 
 ### Added

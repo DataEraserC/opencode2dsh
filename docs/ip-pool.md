@@ -468,17 +468,18 @@ POST {zen}/v1/chat/completions
 
 全部进 settings namespace，设置页可调（maxConcurrentProbes 也开放：有些用户宁可慢也不并发）。
 
-## 5. 设置页（DSH 设置 → 插件 → 可配置插件）
+## 5. 设置页（DSH 设置 → 插件 → opencode2dsh 详情）
 
-复刻 dsh-llm-proxy 验证过的三层结构，但按本机宿主实测裁剪（2026-09-05，`@deepseek-ai/dsh@0.1.1-rc.2`）：
+复刻 dsh-llm-proxy 验证过的三层结构，但按本机宿主实测裁剪（2026-09-05 基于 `@deepseek-ai/dsh@0.1.1-rc.2`；**0.1.7 修订**：入口从旧的「可配置插件」tab 移到插件详情页的 `plugins.item` 槽位，namespace 变成 Loader entry id `opencode2dsh`，可编辑字段只有 `ipPool`）。
 
-- **settings 读写走官方通道，不建兜底**：rc.2 的 host-apiproxy `settings.describe/mutate` 对**所有已注册 namespace** 服务（源码核实无 allowlist；rc.6 才有硬编码清单），所以 dsh-llm-proxy 那套「官方 scope 不可用时切自建 bridge」的 compat 层我们**不做**——客户端直接 `ctx.settingsScope.bind({namespace: 'ip-pool'})`，写路径 `scope.set/unset`（字段级 path op，revision fencing 由 SettingsScopeController 负责）。
+- **settings 读写走官方通道，不建兜底**：宿主 `settings.describe/mutate` 对**所有已注册 namespace** 服务（源码核实无 allowlist；rc.6 才有硬编码清单），所以 dsh-llm-proxy 那套「官方 scope 不可用时切自建 bridge」的 compat 层我们**不做**。**2026-09-19 修订**：`ctx.settingsScope` 服务已被 DSH 移除，0.1.7 起改由 `@deepseek-ai/dsh-client-ui-settings` 提供的 `configForms` 服务承担；注入令牌必须同步改成 `configForms`，否则客户端停在 `pending (waiting for service: settingsScope)`、插件整体不激活。**0.1.7 终版修订**：卡片不再自己 `ctx.configForms.get(...)`，改用插件页交给 `view:'page'` 的 `ConfigPageForm`（`{ state, mutate }`），写路径 `form.mutate(ops, state.revision)`（字段级 path op，revision fencing 由 ConfigFormController 负责）；页面挂载门控用 `ctx.configForms.whileServed(['opencode2dsh'], …)`，宿主不提供该 entry 设置时整张卡片不出现。
+- **可编辑字段只有 `ipPool`**：宿主 `volatileForm(schema)` 只保留**最近一个 volatile 祖先**下的字段（`packages/settings/settings/src/schema.ts`），所以被服务的表单值是 `{ ipPool: … }` 而非 namespace 本身——每条写路径都带 `ipPool` 前缀（`['ipPool', field]`）。namespace 也是 Loader entry id（`opencode2dsh`），不再是单独的 `ip-pool` id。
 - **bridge 只补官方通道做不到的两件事**：池运行时没有 settings 对应物的读（`/status`：四态、出口表、封禁表、Prober 进度 x/y）与动作（`/probe`：批量探活/单出口探活/手动 refill 入队）。**探测与状态必须宿主侧跑**：要走真实 undici/凭据路径。
-- 平台 seeds 实测（web-frontend dist 内核表）：`react`、`react/jsx-runtime`、`react-dom`、`react-dom/client`、`@deepseek-ai/cordis`、`@deepseek-ai/dsh-client-ui-slots`、`@deepseek-ai/dsh-client-ui-primitives`；`@deepseek-ai/dsh-client-runtime/client` 是 preload 图行（非 seed，但同样可 external）。
+- 平台 seeds 实测（web-frontend dist 内核表）：`react`、`react/jsx-runtime`、`react-dom`、`react-dom/client`、`@deepseek-ai/cordis`、`@deepseek-ai/dsh-client-ui-slots`、`@deepseek-ai/dsh-client-ui-primitives`。`@deepseek-ai/dsh-client-runtime/client` 在 0.1.7 宿主上已不在 seed 表内，客户端半也不再引用它（Context 类型直接取自 `@deepseek-ai/cordis`），故 externals 收敛为上表七项。
 
 ```
-浏览器侧 React 卡片（settings.plugin.item slot，keyed by 'ip-pool'，lib/client.js 经 __ModuleLoader__ 注入）
-   │ 配置读写：官方 settingsScope（apiproxy settings.describe/mutate RPC）
+浏览器侧 React 页面（plugins.item slot，id = 'opencode2dsh'，lib/client.js 经 __ModuleLoader__ 注入）
+   │ 配置读写：官方 configForms（apiproxy settings.describe/mutate RPC，路径 ['ipPool', field]）
    │ 状态/动作：same-origin fetch
    ▼
 宿主侧 bridge（webServer.register，/api/opencode2dsh/ip-pool/{status,probe}，loopback-only）
@@ -536,22 +537,35 @@ dsh-llm-proxy 的 bridge 有四个面（describe/mutate/models/test），前两�
 - `POST /status`：池状态机快照——四态徽章 + 可用/容量 + 来源计数（free/manual/subscription）+ 两级健康（出口表：地址/来源/位置/延迟/质量/出口 IP/状态/冷却到期时刻 + 封禁表：(出口, 模型, bannedAt)）+ Prober 队列进度（enqueued/completed/inFlight/queued）+ refill 上轮摘要 + 订阅层状态（pendingConversion 数、convertedAdmitted、lastFetch、lastError——**不含 URL 明文**）。返回结构化 JSON，卡片 3s 轮询（探活进行中 1s）。
 - `POST /probe`：`{scope: 'all'|'exit'|'refill', exitId?}`。`all`：全池出口 × probeModels 的周期探测一次（入 Prober 队列，返回队列长度，前端看 /status 进度）；`exit`：单出口插队探测；`refill`：手动触发一次状态机 refill 轮（免费源抓取+准入）。探测在宿主侧跑：走 Prober 两级调度（同出口串行 + 全局上限），不碰浏览器。
 - 路由护栏照抄 dsh-llm-proxy settings.js：loopback socket + 规范 Host + same-origin 三重校验、JSON body 上限、`{ok, code, message}` 信封。**不做 settings 代理面**（官方通道在）。
-- 卡片注册进 `settings.plugin.item`（keyed slot，`key: 'ip-pool'`——即 namespace 名）；`configurable` tab 按 namespace 取交集分派，卡片在官方 settingsScope ready 后渲染。
+- 页面注册进 `plugins.item`（`@deepseek-ai/dsh-client-ui-plugin-manager` 拥有的 list slot，`id: 'opencode2dsh'`）；插件页拥有卡片外框、标题、one-liner 与保存按钮，`view:'summary'` 返回描述、`view:'page'` 返回表单，保存走共享 `SettingsForm` 外框。挂载门控 `ctx.configForms.whileServed(['opencode2dsh'], …)`，官方 form ready 之前不渲染。0.1.7 之前的 keyed `settings.plugin.item` 与双形态兼容分支都已删除。
 
 ### 5.4 客户端构建
 
-照搬 dsh-llm-proxy 的 tsdown 配置（tsdown.config.ts 全文可抄，但平台 externals 按本机 rc.2 seeds 核实）：`format: 'cjs'`、`platform: 'browser'`、`window.__ModuleLoader__.load({id, factory})` banner/footer、纯度门插件（非 seed 的 `@deepseek-ai/*` 值导入报错）、lightningcss 内联 CSS Modules。externals = 平台 seeds + `@deepseek-ai/dsh-client-runtime/client`（preload 图行，合法 external）。包的 `dsh` 字段加：
+照搬 dsh-llm-proxy 的 tsdown 配置（tsdown.config.ts 全文可抄，但平台 externals 按本机 seeds 核实）：`format: 'cjs'`、`platform: 'browser'`、`window.__ModuleLoader__.load({id, factory})` banner/footer、纯度门插件（非 seed 的 `@deepseek-ai/*` 值导入报错）、lightningcss 内联 CSS Modules。externals = 上文实测的平台 seeds 七项。包的 `dsh` 字段加：
 
 ```json
 "dsh": {
   "bundle": { "patch": "./cordis.patch.yml" },
-  "client": { "inject": ["slots", "locale", "settingsScope"], "platform": "web" }
+  "client": {
+    "inject": [
+      "@deepseek-ai/dsh-client-locale",
+      "@deepseek-ai/dsh-client-ui-settings",
+      "@deepseek-ai/dsh-client-ui-plugin-manager"
+    ],
+    "platform": "web"
+  }
 }
 ```
 
+> **`dsh.client.inject` 装的是包行（package row），不是服务名**（0.1.7 修订）：client-modules 把每一项当 row id 解析，用这些边等 factory 到达与插件组合；服务名不是 row，边解析不到东西，bundle 就会在它需要的服务之前加载。服务清单放在 client entry 自己的 `inject` 导出里。`test/client-build.test.ts` 断言 manifest 每一项都以 `@deepseek-ai/` 开头。
+
 （`remote` 不需要：没有跨 fiber 的 settings/document-updated 监听需求，官方 mirror 自己处理失效。）
 
-构建链随版本走：tsdown 0.15（仓库现有 devDep）+ lightningcss 1.32（dsh-llm-proxy 同版）+ `@deepseek-ai/dsh-client-{runtime,locale,ui-slots,ui-primitives,ui-settings-plugins}@0.1.1-rc.2` 仅 devDependencies（类型与构建期 externals 对齐宿主；运行时由宿主 seeds 提供，不进生产依赖）。`build:client` 独立 script，`build`（宿主半）+ `build:client` 都进 `prepack`。
+> **注入令牌与代码必须同步**：manifest 里的 `dsh.client.inject` 与 `src/client/index.ts` 导出的 `inject` 都会被宿主当作 fiber 依赖，多一个（或少一个）不存在的服务名，客户端就停在 `pending (waiting for service: X)`，整个插件不激活。`test/client-build.test.ts` 里有一条断言专门锁住两者一致。
+
+构建链随版本走：tsdown 0.15（仓库现有 devDep）+ lightningcss 1.32（dsh-llm-proxy 同版）+ client devDependencies 钉在 `0.1.7-rc.2`：`dsh-client-{locale,ui-slots,ui-primitives,ui-settings,ui-plugin-manager,ui-renderer}` + `@deepseek-ai/cordis ~4.0.4`（跟随 cordis-peer 一并对齐，`pnpm peers check` 干净）。`@deepseek-ai/dsh-client-runtime` 保留 `0.1.1-rc.2`：registry 上没有 0.1.7 发布，且客户端半已不再引用它（Context 类型直接取自 `@deepseek-ai/cordis`）。旧的 `dsh-client-ui-settings-plugins` 已删除——0.1.7 用 plugin-manager 的 `plugins.item` 取代了它。类型与构建期 externals 对齐宿主；运行时由宿主 seeds 提供，不进生产依赖。`build:client` 独立 script，`build`（宿主半）+ `build:client` 都进 `prepack`。
+
+> **版本注意**：`ConfigForm` / `ConfigFormSnapshot` 从 0.1.7-alpha.1 才出现，0.1.1-rc.2 那版导出的是被移除的 `settingsScope`。但 `ConfigForm` 在 0.1.7 仍然保留，所以卡片只是**换了承载面**（`plugins.item` + 页给我们的 `ConfigPageForm`），内部 `ConfigFormModel`/`SettingsFormModel` 那套通用表单层不必引入——复杂的探活/出口表控件继续自己写，保存与丢弃交给共享 `SettingsForm` 外框。
 
 ## 6. 文件落点（增量，不动现有结构）
 
@@ -570,11 +584,12 @@ packages/plugin/
 │   │   ├── subscription-fetcher.ts     # 订阅拉取+节点分路+受控探活
 │   │   └── singbox.ts                 # sing-box 子进程托管（配置生成/端口映射/重载，§1.2.2）
 │   ├── ip-pool-settings/              # IP-5 宿主半
-│   │   ├── namespace.ts               # schemastery Config + ctx.settings.register('ip-pool') + watch 热更新
+│   │   ├── apply.ts                   # volatile 引导 + loader/volatile-update 热更新
+│   │   ├── namespace.ts               # 导出 Config（ipPool 单一 volatile 节点）+ VolatileRef 读
 │   │   └── bridge.ts                  # webServer 路由（/status /probe，loopback-only）
 │   └── client/                        # IP-5 浏览器半边（新）
-│       ├── index.ts                   # slots.inject('settings.plugin.item', key: 'ip-pool') + scope 绑定
-│       ├── IpPoolCard.tsx
+│       ├── index.ts                   # configForms.whileServed + slots.inject('plugins.item', id: 'opencode2dsh')
+│       ├── IpPoolCard.tsx             # 页给的 ConfigPageForm；写路径 ['ipPool', field]
 │       ├── locales.ts                 # zh/en
 │       ├── ip-pool.module.css
 │       └── css-modules.d.ts           # 类型 shim
