@@ -191,14 +191,19 @@ export function buildOutbound(node: ParsedNode, tag: string): Record<string, unk
     case 'hysteria2':
       out.type = 'hysteria2'
       out.password = getStr(raw, 'password')
-      applyTLS(raw, out)
+      // hysteria2 is TLS-mandatory (QUIC + TLS; sing-box check rejects it
+      // with "TLS required"), and Clash entries for it often carry neither
+      // a `tls` flag nor an `sni` field — force TLS on like anytls so the
+      // generated config always passes `sing-box check`.
+      applyTLS({ ...raw, tls: true }, out)
       break
     case 'tuic':
       out.type = 'tuic'
       out.uuid = getStr(raw, 'uuid')
       out.password = getStr(raw, 'password')
       out.congestion_control = getStrDefault(raw, 'congestion-controller', 'bbr')
-      applyTLS(raw, out)
+      // tuic is TLS-mandatory too (QUIC + TLS, same as hysteria2 above).
+      applyTLS({ ...raw, tls: true }, out)
       break
     case 'anytls':
       out.type = 'anytls'
