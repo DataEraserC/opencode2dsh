@@ -144,6 +144,23 @@ async function toPiImage(ref: unknown): Promise<PiContentBlock> {
   }
 }
 
+/**
+ * Host-budget-offloaded images were routed out of the request by dsh-llm on
+ * purpose (`offloaded: true`); re-reading their bytes from disk would defy the
+ * image budget the host already enforced. Emit a stable placeholder instead —
+ * the same semantics as the host adapter's projectOffloadedImages.
+ */
+function offloadedImagePart(ref: unknown): PiContentBlock {
+  const id = (ref as { attachmentId?: unknown } | null | undefined)?.attachmentId
+  const short = typeof id === 'string' && id.length > 0 ? ` ${id.slice(0, 30)}` : ''
+  return { type: 'text', text: `[image omitted: offloaded to fit the request image budget${short}]` }
+}
+
+/** One image block, respecting the host's offload flag. */
+async function imagePart(block: { type?: unknown; attachment?: unknown; offloaded?: unknown }): Promise<PiContentBlock> {
+  return block.offloaded === true ? offloadedImagePart(block.attachment) : toPiImage(block.attachment)
+}
+
 /** Text/image parts of one user message's content, in block order. */
 async function userParts(blocks: HarnessBlock[]): Promise<PiContentBlock[]> {
   const parts: PiContentBlock[] = []
@@ -151,7 +168,7 @@ async function userParts(blocks: HarnessBlock[]): Promise<PiContentBlock[]> {
     if (block.type === 'text') {
       if (block.text.length > 0) parts.push({ type: 'text', text: block.text })
     } else if (block.type === 'image') {
-      parts.push(await toPiImage(block.attachment))
+      parts.push(await imagePart(block))
     }
   }
   return parts
@@ -164,7 +181,7 @@ async function toolResultParts(blocks: HarnessBlock[]): Promise<PiContentBlock[]
     if (block.type === 'text') {
       parts.push({ type: 'text', text: block.text })
     } else if (block.type === 'image') {
-      parts.push(await toPiImage(block.attachment))
+      parts.push(await imagePart(block))
     } else if (block.type === 'tool-result') {
       parts.push(...(await toolResultParts(block.content)))
     }

@@ -198,6 +198,36 @@ test('a lone image message keeps content as a parts array', async () => {
   })
 })
 
+test('offloaded image blocks stay out of the request even when the object exists', async () => {
+  // The host flagged this occurrence as out-of-budget (offloaded: true);
+  // the bytes ARE on disk, but re-reading them would defy the request budget
+  // dsh-llm already enforced — the placeholder must win over the store.
+  const sha = 'c'.repeat(64)
+  const bytes = Buffer.from('bytes that exist but are offloaded')
+  await withDshHome(async (home) => {
+    await putObject(home, sha, bytes)
+    const context = await toPiContext(
+      options({
+        messages: [
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'image',
+                attachment: { attachmentId: `sha256:${sha}`, mediaType: 'image/png' },
+                offloaded: true,
+              },
+            ],
+          },
+        ],
+      }),
+    )
+    const user = expectRole(context.messages[0], 'user') as Extract<PiMessage, { role: 'user' }>
+    assert.equal(typeof user.content, 'string')
+    assert.match(user.content as string, /image omitted: offloaded to fit the request image budget/)
+  })
+})
+
 test('tool results keep image blocks alongside text', async () => {
   const sha = 'b'.repeat(64)
   const bytes = Buffer.from('tool result image bytes')

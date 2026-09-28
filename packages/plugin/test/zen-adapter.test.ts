@@ -25,14 +25,17 @@ test('providerRetryPolicy defers to the host default', () => {
   assert.equal(adapter.providerRetryPolicy('opencode2dsh'), undefined)
 })
 
-test('resolveModel declares image-capable input and finite limits', () => {
+test('resolveModel declares image input only for verified vision models', () => {
   const adapter = new ZenAdapter(new ModelCatalog())
-  const resolved = adapter.resolveModel('opencode2dsh', 'big-pickle')
-  assert.deepEqual(resolved.inputModalities, ['text', 'image'])
-  assert.equal(resolved.context.contextWindow > 0, true)
-  assert.equal(resolved.defaultMaxTokens > 0, true)
-  assert.equal(resolved.provider, 'opencode2dsh')
-  assert.equal(resolved.id, 'big-pickle')
+  const textOnly = adapter.resolveModel('opencode2dsh', 'big-pickle')
+  assert.deepEqual(textOnly.inputModalities, ['text'])
+  assert.equal(textOnly.context.contextWindow > 0, true)
+  assert.equal(textOnly.defaultMaxTokens > 0, true)
+  assert.equal(textOnly.provider, 'opencode2dsh')
+  assert.equal(textOnly.id, 'big-pickle')
+  // The mimo-v2.6 family is the live-verified vision lane (2026-09-28).
+  const vision = adapter.resolveModel('opencode2dsh', 'mimo-v2.6-flash-free')
+  assert.deepEqual(vision.inputModalities, ['text', 'image'])
 })
 
 test('prepareCall returns the resolved model and a stream dispatcher', async () => {
@@ -44,13 +47,14 @@ test('prepareCall returns the resolved model and a stream dispatcher', async () 
 
 test('listModels mirrors the catalog without duplicates', () => {
   const adapter = new ZenAdapter({
-    list: () => ['big-pickle', 'big-pickle', 'mimo-v2.5-free'],
+    list: () => ['big-pickle', 'big-pickle', 'mimo-v2.5-free', 'mimo-v2.6-flash-free'],
     decision: () => ({ allowed: true, source: 'test', known: true }),
     reasoningCapability: () => ({ reasoning: true, effortValues: [] }),
   })
   const models = adapter.listModels('opencode2dsh')
-  assert.deepEqual(models.map((m) => m.id), ['big-pickle', 'mimo-v2.5-free'])
-  assert.deepEqual(models.map((m) => m.inputModalities), [['text', 'image'], ['text', 'image']])
+  assert.deepEqual(models.map((m) => m.id), ['big-pickle', 'mimo-v2.5-free', 'mimo-v2.6-flash-free'])
+  // Only the verified vision family advertises image input.
+  assert.deepEqual(models.map((m) => m.inputModalities), [['text'], ['text'], ['text', 'image']])
 })
 
 test('reasoningEfforts: declared ladder wins, none folds into off, default ladder otherwise', () => {
