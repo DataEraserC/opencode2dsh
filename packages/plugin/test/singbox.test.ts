@@ -58,13 +58,19 @@ test('buildOutbound: trojan/vless/hysteria2/tuic map their credentials', () => {
     name: 'h', type: 'hysteria2', server: 'h.example.com', port: 443,
     raw: { type: 'hysteria2', password: 'pw2' },
   }, 'out-h')
-  assert.deepEqual(hy2, { tag: 'out-h', type: 'hysteria2', server: 'h.example.com', server_port: 443, password: 'pw2' })
+  // hysteria2 is TLS-mandatory: TLS is forced on even with no sni/tls flags
+  assert.deepEqual(hy2, {
+    tag: 'out-h', type: 'hysteria2', server: 'h.example.com', server_port: 443,
+    password: 'pw2', tls: { enabled: true },
+  })
 
   const tuic = buildOutbound({
     name: 'tu', type: 'tuic', server: 'q.example.com', port: 443,
     raw: { type: 'tuic', uuid: 'u', password: 'p' },
   }, 'out-tu')
   assert.equal(tuic?.congestion_control, 'bbr')
+  // tuic is TLS-mandatory too
+  assert.deepEqual(tuic?.tls, { enabled: true })
 })
 
 test('buildOutbound: anytls forces TLS on (GoProxy forceTLS)', () => {
