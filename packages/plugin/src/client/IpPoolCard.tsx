@@ -24,6 +24,7 @@ import type {} from '@deepseek-ai/dsh-client-ui-plugin-manager/client'
 // `ConfigPageForm`, the face this page now reads and writes through.
 import type { ConfigFormSnapshot } from '@deepseek-ai/dsh-client-ui-settings/client'
 import type { en } from './locales.ts'
+import { diffWrites, splitCsv } from './ip-pool-diff.ts'
 import styles from './ip-pool.module.css'
 
 /** The reactive values and commands the Plugins page supplies for this page. */
@@ -145,13 +146,8 @@ function redactUrl(url: string): string {
   return url.slice(0, 12) + '…' + url.slice(-6)
 }
 
-/** JSON deep-equal over the card's plain values. */
-function deepEqual(a: unknown, b: unknown): boolean {
-  return JSON.stringify(a) === JSON.stringify(b)
-}
-
 /** Draft form state (strings for inputs; arrays kept as string lists). */
-interface FormState {
+export interface FormState {
   enabled: boolean
   freeEnabled: boolean
   targetSize: string
@@ -208,9 +204,6 @@ interface ServedEntry {
   ipPool?: Partial<IpPoolSettingsValue>
 }
 
-/** Field writes landing the form on the resolved value, in write order. */
-interface FieldWrite { field: string; op: 'set'; value: unknown }
-
 /**
  * The ip-pool section of the served value, with defaults filled. A missing
  * section (an empty document, or a namespace the Host serves empty) reads as
@@ -219,37 +212,6 @@ interface FieldWrite { field: string; op: 'set'; value: unknown }
 function servedSection(state: ConfigFormSnapshot<Record<string, unknown>> | undefined): IpPoolSettingsValue {
   const served = (state?.value as ServedEntry | undefined)?.ipPool
   return { ...DEFAULTS, ...(served ?? {}), ...(served?.free ? { free: { ...DEFAULTS.free, ...served.free } } : {}), ...(served?.subscription ? { subscription: { ...DEFAULTS.subscription, ...served.subscription } } : {}), ...(served?.singbox ? { singbox: { ...DEFAULTS.singbox, ...served.singbox } } : {}) } as IpPoolSettingsValue
-}
-
-/** The composition-side (base) ip-pool section, for the values a reset returns to. */
-function servedBase(state: ConfigFormSnapshot<Record<string, unknown>> | undefined): Partial<IpPoolSettingsValue> {
-  return ((state?.base as ServedEntry | undefined)?.ipPool) ?? {}
-}
-
-function diffWrites(form: FormState, value: IpPoolSettingsValue, base: Partial<IpPoolSettingsValue>): FieldWrite[] {
-  const writes: FieldWrite[] = []
-  const push = (field: string, next: unknown, current: unknown, baseValue: unknown): void => {
-    if (deepEqual(next, current)) return
-    if (deepEqual(next, baseValue)) return // reverts inherit via unset, but the
-    // official scope only has set/unset per scalar field; a value equal to base
-    // still needs set (unset would drop user intent on other fields) — so no
-    // unset path here: set carries it.
-    writes.push({ field, op: 'set', value: next })
-  }
-  push('enabled', form.enabled, value.enabled, base.enabled)
-  push('free', { enabled: form.freeEnabled, targetSize: Number(form.targetSize), blockedCountries: splitCsv(form.blockedCountries) }, value.free, base.free)
-  push('manual', form.manual, value.manual, base.manual)
-  push('subscription', { urls: form.subscriptionUrls, refreshMs: Number(form.refreshMs) }, value.subscription, base.subscription)
-  push('singbox', { path: form.singboxPath, idleStopMs: Number(form.singboxIdleStopMs) }, value.singbox, base.singbox)
-  push('pinnedExitId', form.pinnedExitId, value.pinnedExitId, base.pinnedExitId)
-  push('pinnedStrict', form.pinnedStrict, value.pinnedStrict, base.pinnedStrict)
-  push('probeModels', form.probeModels, value.probeModels, base.probeModels)
-  push('maxConcurrentProbes', Number(form.maxConcurrentProbes), value.maxConcurrentProbes, base.maxConcurrentProbes)
-  return writes
-}
-
-function splitCsv(line: string): string[] {
-  return line.split(',').map((part) => part.trim().toUpperCase()).filter((part) => part.length > 0)
 }
 
 /** One-line live refill progress: stage + counters (docs §5.3). */
@@ -653,7 +615,7 @@ function CardBody(props: { settings: ConfigPageForm | undefined; t: IpPoolCardPr
     return null
   }
 
-  const writes = diffWrites(formRef.current, served, servedBase(snapshot))
+  const writes = diffWrites(formRef.current, served)
   const validation = validate()
   const dirty = writes.length > 0 || validation !== null
   const available = snapshot?.status === 'ready' && settings !== undefined

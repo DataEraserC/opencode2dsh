@@ -299,6 +299,28 @@ export async function startIpPool(
     }
   }
 
+  /**
+   * Engage exit routing once the pool holds exits from ANY source. The boot
+   * install() below only sees the snapshot at start and the free refill's
+   * onAdmitted hook only sees free admissions, so a subscription-only pool
+   * (free dry or free off) could sit full with routing off until someone
+   * touched settings — live-observed 2026-09-29: 247 converted exits, every
+   * loopback port open, install() never called (status enabled=false with an
+   * empty deferredReason). Throttled so a busy foreign dispatcher slot does
+   * not re-warn every sweep.
+   */
+  let lastOccupancyInstall = 0
+  const installWhenOccupied = (): void => {
+    if (config.ipPool?.enabled === false) return
+    if (installer.enabled || pool.snapshot().total === 0) return
+    if (Date.now() - lastOccupancyInstall < 60_000) return
+    lastOccupancyInstall = Date.now()
+    installer.install()
+    if (installer.enabled) {
+      logger.info('opencode2dsh: pool has exits — exit routing engaged (occupancy)')
+    }
+  }
+
   let fetcherActive = false
   if (pool.snapshot().total > 0) {
     installer.install()
@@ -312,6 +334,9 @@ export async function startIpPool(
   // an idle enabled pool, and a child spawned by a probe after disable (the
   // disable flip itself stops it synchronously in reconfigure).
   const idleTimer = setInterval(() => {
+    // Routing-occupancy backstop: catches conversions landing from any source
+    // (subscription refresh, enable-flip retry) within 30s of occupancy.
+    installWhenOccupied()
     const s = supervisor
     if (s === undefined || !s.running) return
     const ms = config.ipPool?.singbox?.idleStopMs ?? DEFAULT_IDLE_STOP_MS
@@ -450,6 +475,11 @@ export async function startIpPool(
         const convert = (): void => {
           void subscriptions?.convertPending().catch((err: unknown) => {
             logger.warn(`opencode2dsh: converting parked nodes on enable failed (${err instanceof Error ? err.message : String(err)})`)
+          }).then(() => {
+            // Conversions just changed occupancy — engage routing now instead
+            // of waiting for the 30s sweep (the enable flip ran the install
+            // gate while the pool was still empty).
+            installWhenOccupied()
           })
         }
         convert()
