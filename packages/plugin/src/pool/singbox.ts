@@ -4,10 +4,12 @@
  * plugin will ever spawn, and only when the user's subscriptions carry
  * encrypted nodes:
  *
- *   ParsedNode[] -> config JSON (one local SOCKS5 inbound per node, port
- *   30000+ ascending) -> `sing-box check` preflight -> `sing-box run` ->
- *   port-readiness wait. The converted nodes return as local http-address
- *   exits and join the pool through the trusted admission path.
+ *   ParsedNode[] -> config JSON (K fixed SOCKS5 lane inbounds, 30001+
+ *   ascending, plus N port-less outbounds behind per-lane selectors —
+ *   端口上限: 占用恒等于 K+1 而不是 N, docs 1.2.4) -> `sing-box check`
+ *   preflight -> `sing-box run` -> lane-port readiness wait. The converted
+ *   nodes return as `lane:` pool ids and join the pool through the trusted
+ *   admission path (smoke rides a borrowed lane).
  *
  * Process supervision: interrupt -> 5s grace -> kill (Windows: taskkill /T
  * since signals are not deliverable), exit-watch so crashes surface, and
@@ -23,21 +25,25 @@ import { mkdir, rename, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import type { ParsedNode } from './subscription.ts'
+import { LanePool, laneAddressOf, selectorTagOf, type LaneConfigure } from './lanes.ts'
 
 export interface SingBoxOptions {
   /** sing-box binary: PATH name or absolute path. */
   binPath: string
   /** Directory for config + working dir. */
   dataDir: string
-  /** First local SOCKS5 port (default 30000, ascending per node). */
+  /** First local SOCKS5 port (default 30000; lanes take basePort+1..+K). */
   basePort?: number
+  /** Lane count K — the local port budget (default 16; docs 1.2.4). */
+  lanes?: number
   /** Port-readiness wait (default 10s). */
   readyTimeoutMs?: number
   logger?: { info(message: string): void; warn(message: string): void }
 }
 
 export interface ConvertedExit {
-  /** Local dial address: 127.0.0.1:<port>. */
+  /** Lane-backed pool id: `lane:<type>:<server>:<port>` (no local port —
+   *  the lane is assigned at dial time, docs 1.2.4). */
   address: string
   protocol: 'socks5'
   /** The source node this exit serves (diagnostics + dedupe key). */
@@ -219,10 +225,17 @@ export function buildOutbound(node: ParsedNode, tag: string): Record<string, unk
 
 // -- config generation --------------------------------------------------------
 
+/** Default lane count K (the local port budget: K lanes + 1 clash API). */
+export const DEFAULT_LANES = 16
+
 export interface GeneratedConfig {
   config: Record<string, unknown>
-  /** nodeKey -> local port. */
-  portMap: Map<string, number>
+  /** nodeKey -> sing-box outbound tag (convertible nodes only). */
+  outTags: Map<string, string>
+  /** The K lane inbound ports (basePort+1 .. basePort+K). */
+  lanePorts: number[]
+  /** clash-API control port (basePort+K+1) — the selector switches live on. */
+  apiPort: number
 }
 
 /** nodeKey (GoProxy): type:server:port. */
@@ -240,41 +253,56 @@ export function sameNodes(a: ParsedNode[], b: ParsedNode[]): boolean {
   return true
 }
 
-/** The full sing-box config for a node list (GoProxy generateConfig). */
-export function generateConfig(nodes: ParsedNode[], basePort = 30_000): GeneratedConfig {
-  const portMap = new Map<string, number>()
-  const inbounds: Array<Record<string, unknown>> = []
+/** The full sing-box config for a node list (docs 1.2.4):
+ *  K lane inbounds (fixed port budget) + N port-less node outbounds +
+ *  one selector per lane + the clash API controller. */
+export function generateConfig(
+  nodes: ParsedNode[],
+  basePort = 30_000,
+  lanes = DEFAULT_LANES,
+): GeneratedConfig {
+  const laneCount = Math.max(1, Math.floor(lanes))
+  const lanePorts = Array.from({ length: laneCount }, (_, i) => basePort + 1 + i)
+  const apiPort = basePort + 1 + laneCount
+  const outTags = new Map<string, string>()
+  const nodeTags: string[] = []
   const outbounds: Array<Record<string, unknown>> = []
-  const rules: Array<Record<string, unknown>> = []
-  let port = basePort
-  nodes.forEach((node, index) => {
-    port += 1
-    const tag = `node-${index}`
-    portMap.set(nodeKeyOf(node), port)
-    inbounds.push({
-      type: 'socks',
-      tag: `in-${tag}`,
-      listen: '127.0.0.1',
-      listen_port: port,
-    })
-    const outbound = buildOutbound(node, `out-${tag}`)
-    if (outbound === null) {
-      portMap.delete(nodeKeyOf(node))
-      inbounds.pop()
-      return
-    }
+  for (const node of nodes) {
+    const key = nodeKeyOf(node)
+    if (outTags.has(key)) continue
+    // Stable, content-derived tag: survives reordering so selectors and
+    // clash-API names never shift under a refresh.
+    const tag = `out-${key.replace(/[^a-zA-Z0-9._-]/g, '_')}`
+    const outbound = buildOutbound(node, tag)
+    if (outbound === null) continue
     outbounds.push(outbound)
-    rules.push({ inbound: [`in-${tag}`], outbound: `out-${tag}` })
-  })
-  outbounds.push({ type: 'direct', tag: 'direct' })
+    outTags.set(key, tag)
+    nodeTags.push(tag)
+  }
+  const inbounds = lanePorts.map((port, i) => ({
+    type: 'socks',
+    tag: `lane${i}`,
+    listen: '127.0.0.1',
+    listen_port: port,
+  }))
+  const rules = lanePorts.map((_, i) => ({ inbound: [`lane${i}`], outbound: selectorTagOf(i) }))
+  const selectors = lanePorts.map((_, i) => ({
+    type: 'selector',
+    tag: selectorTagOf(i),
+    outbounds: [...nodeTags, 'direct'],
+    default: nodeTags[0] ?? 'direct',
+  }))
   return {
     config: {
       log: { level: 'warn' },
+      experimental: { clash_api: { external_controller: `127.0.0.1:${apiPort}` } },
       inbounds,
-      outbounds,
+      outbounds: [...selectors, ...outbounds, { type: 'direct', tag: 'direct' }],
       route: { rules, final: 'direct' },
     },
-    portMap,
+    outTags,
+    lanePorts,
+    apiPort,
   }
 }
 
@@ -297,11 +325,14 @@ function canConnect(port: number, timeoutMs = 1_000): Promise<boolean> {
 
 export class SingBoxSupervisor {
   readonly #options: SingBoxOptions
+  readonly #lanes: LanePool
   #child: ChildProcess | null = null
   #running = false
   #configPath: string
   #dataDir: string
-  #portMap = new Map<string, number>()
+  #outTags = new Map<string, string>()
+  #lanePorts: number[] = []
+  #apiPort = 0
   #nodes: ParsedNode[] = []
   /** Reload serialization chain (see reload): concurrent reloads collapse. */
   #reloadChain: Promise<unknown> = Promise.resolve()
@@ -310,6 +341,12 @@ export class SingBoxSupervisor {
     this.#options = options
     this.#dataDir = options.dataDir
     this.#configPath = join(options.dataDir, 'singbox-config.json')
+    this.#lanes = new LanePool(options.logger ? { logger: options.logger } : {})
+  }
+
+  /** The lane table (dispatcher + admission bind through it). */
+  get lanes(): LanePool {
+    return this.#lanes
   }
 
   /** Live re-apply of the binary path (settings page, docs §5.1). The next
@@ -318,12 +355,23 @@ export class SingBoxSupervisor {
     this.#options.binPath = path
   }
 
+  /** Live re-apply of the lane count (settings page). A changed K changes
+   *  the config shape, so a running child respawns on the next reload —
+   *  documented as dropping in-flight streams (same as a node refresh). */
+  setLaneCount(count: number): boolean {
+    const next = Math.max(1, Math.floor(count))
+    if ((this.#options.lanes ?? DEFAULT_LANES) === next) return false
+    this.#options.lanes = next
+    return this.#running
+  }
+
   get running(): boolean {
     return this.#running
   }
 
-  get portMap(): Map<string, number> {
-    return new Map(this.#portMap)
+  /** Lane budget + ports for diagnostics (status bridge, docs 1.2.4). */
+  get laneInfo(): { count: number; ports: number[]; apiPort: number } {
+    return this.#lanes.info()
   }
 
   /** The binary location: absolute path as-is; bare name must exist on PATH
@@ -364,18 +412,25 @@ export class SingBoxSupervisor {
     if (nodes.length === 0) {
       await this.stop()
       this.#nodes = []
-      this.#portMap = new Map()
+      this.#outTags = new Map()
+      this.#lanePorts = []
+      this.#apiPort = 0
       return []
     }
+    const laneCount = Math.max(1, Math.floor(this.#options.lanes ?? DEFAULT_LANES))
     // Idempotent reload (ports follow use, docs 1.2.3): the same node set in
-    // the same order yields the same ports and the same config, so a
+    // the same order (and the same lane budget) yields the same config, so a
     // subscription refresh with unchanged nodes must NOT recycle the child —
     // a respawn would only drop in-flight streams every refresh interval.
-    if (this.#running && sameNodes(this.#nodes, nodes)) {
-      return this.#exitsFor(this.#nodes, this.#portMap)
+    if (this.#running && sameNodes(this.#nodes, nodes) && this.#lanePorts.length === laneCount) {
+      return this.#exitsFor(this.#nodes)
     }
     const binary = await this.#resolveBinary()
-    const { config, portMap } = generateConfig(nodes, this.#options.basePort ?? 30_000)
+    const { config, outTags, lanePorts, apiPort } = generateConfig(
+      nodes,
+      this.#options.basePort ?? 30_000,
+      laneCount,
+    )
 
     // atomic config write (tmp + rename)
     await mkdir(this.#dataDir, { recursive: true })
@@ -400,21 +455,28 @@ export class SingBoxSupervisor {
     })
     const child = this.#child
     this.#nodes = nodes
-    this.#portMap = portMap
+    this.#outTags = outTags
+    this.#lanePorts = lanePorts
+    this.#apiPort = apiPort
     child.stderr?.on('data', (chunk: Buffer) => {
       const text = chunk.toString('utf8').trim()
       if (text.length > 0) this.#options.logger?.info(`[sing-box] ${text}`)
     })
     child.once('exit', () => {
-      if (this.#child === child) this.#running = false
+      if (this.#child === child) {
+        this.#running = false
+        this.#lanes.reset()
+      }
     })
     child.once('error', () => {
-      if (this.#child === child) this.#running = false
+      if (this.#child === child) {
+        this.#running = false
+        this.#lanes.reset()
+      }
     })
 
-    // port readiness (GoProxy: 20 x 500ms over the first port)
+    // lane-port readiness (same 20 x 500ms budget over the first lane port)
     const deadline = Date.now() + (this.#options.readyTimeoutMs ?? 10_000)
-    const ports = [...portMap.values()]
     let ready = false
     while (Date.now() < deadline && !ready) {
       // Crash detection while #running is still false (ports follow use:
@@ -422,7 +484,7 @@ export class SingBoxSupervisor {
       // into not-yet-listening ports). "Exited" = no longer OUR live child.
       if (this.#child !== child || child.exitCode !== null) throw new Error('sing-box exited immediately after start (see logs)')
       await new Promise((resolve) => setTimeout(resolve, 500))
-      for (const port of ports) {
+      for (const port of lanePorts) {
         // eslint-disable-next-line no-await-in-loop
         if (await canConnect(port)) {
           ready = true
@@ -430,13 +492,13 @@ export class SingBoxSupervisor {
         }
       }
     }
-    if (!ready) this.#options.logger?.warn('opencode2dsh: sing-box ports not ready in time; some converted nodes may be unreachable')
+    if (!ready) this.#options.logger?.warn('opencode2dsh: sing-box lanes not ready in time; converted nodes may be unreachable')
 
-    // Up AND answering: only now is the local endpoint routable (the
-    // dispatcher's isRunning() gates on this — during warmup it serves
-    // direct instead of striking exits for dead ports).
+    // Up AND answering: only now are the lanes routable (the dispatcher's
+    // isRunning() gates on this) — and only now may bindings be claimed.
+    this.#lanes.configure({ lanePorts, apiPort, outTags })
     this.#running = true
-    return this.#exitsFor(nodes, portMap)
+    return this.#exitsFor(nodes)
   }
 
   /**
@@ -450,13 +512,13 @@ export class SingBoxSupervisor {
     return this.reload(this.#nodes)
   }
 
-  /** Map a node list through its port map to the local SOCKS5 exits. */
-  #exitsFor(nodes: ParsedNode[], portMap: Map<string, number>): ConvertedExit[] {
+  /** Map a node list through the outbound tags to lane-backed pool ids. */
+  #exitsFor(nodes: ParsedNode[]): ConvertedExit[] {
     const exits: ConvertedExit[] = []
     for (const node of nodes) {
-      const port = portMap.get(nodeKeyOf(node))
-      if (port === undefined) continue
-      exits.push({ address: `127.0.0.1:${port}`, protocol: 'socks5', node })
+      const key = nodeKeyOf(node)
+      if (!this.#outTags.has(key)) continue
+      exits.push({ address: laneAddressOf(key), protocol: 'socks5', node })
     }
     return exits
   }
@@ -464,6 +526,7 @@ export class SingBoxSupervisor {
   /** Graceful stop: interrupt -> grace -> kill (taskkill /T on Windows). */
   async stop(): Promise<void> {
     const child = this.#child
+    this.#lanes.reset()
     if (child === null || child.exitCode !== null) {
       this.#running = false
       return

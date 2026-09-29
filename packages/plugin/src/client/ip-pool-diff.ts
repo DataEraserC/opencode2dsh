@@ -40,7 +40,7 @@ export function diffWrites(form: FormState, value: IpPoolSettingsValue): FieldWr
   push('free', { enabled: form.freeEnabled, targetSize: Number(form.targetSize), blockedCountries: splitCsv(form.blockedCountries) }, value.free)
   push('manual', form.manual, value.manual)
   push('subscription', { urls: form.subscriptionUrls, refreshMs: Number(form.refreshMs) }, value.subscription)
-  push('singbox', { path: form.singboxPath, idleStopMs: Number(form.singboxIdleStopMs) }, value.singbox)
+  push('singbox', { path: form.singboxPath, idleStopMs: Number(form.singboxIdleStopMs), lanes: Number(form.singboxLanes) }, value.singbox)
   push('pinnedExitId', form.pinnedExitId, value.pinnedExitId)
   push('pinnedStrict', form.pinnedStrict, value.pinnedStrict)
   push('probeModels', form.probeModels, value.probeModels)

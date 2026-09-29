@@ -59,7 +59,7 @@ test('toIpPoolConfig maps the settings value onto the plugin config shape', () =
   assert.equal(mapped.pinnedStrict, true)
   assert.deepEqual(mapped.subscriptions, ['https://sub.example.com/token'])
   assert.deepEqual(mapped.probeModels, ['big-pickle'])
-  assert.deepEqual(mapped.singbox, { path: 'sing-box', idleStopMs: 600_000 })
+  assert.deepEqual(mapped.singbox, { path: 'sing-box', idleStopMs: 600_000, lanes: 16 })
   // The runtime reads these two off the config shape (ip-pool.ts:
   // Prober construction + SubscriptionFetcher interval), so dropping them here
   // would reset them to the default on every live commit.

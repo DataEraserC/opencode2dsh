@@ -14,7 +14,7 @@
 
 import type { Dispatcher } from 'undici'
 
-import { PoolRoutingDispatcher, type LocalExitHooks, type RoutingDispatcherSurface, type UndiciSeam } from './dispatcher.ts'
+import { PoolRoutingDispatcher, type LanePoolSeam, type LocalExitHooks, type RoutingDispatcherSurface, type UndiciSeam } from './dispatcher.ts'
 import type { ExitPool } from './pool.ts'
 
 /** The setter accepts the full Dispatcher; our router exposes the subset
@@ -28,6 +28,8 @@ export interface InstallerDeps {
   proxyHosts?: string[]
   /** Ports-follow-use seam forwarded to the routing dispatcher (docs 1.2.3). */
   localExit?: LocalExitHooks
+  /** Lane table forwarded to the routing dispatcher (docs 1.2.4). */
+  lanes?: LanePoolSeam
   logger?: { info(message: string): void; warn(message: string): void }
 }
 
@@ -113,6 +115,7 @@ export class RoutingInstaller {
       undici: this.#deps.undici,
       proxyHosts: this.#deps.proxyHosts,
       localExit: this.#deps.localExit,
+      lanes: this.#deps.lanes,
       logger: this.#deps.logger,
     })
     // Capture the pre-install dispatcher BEFORE swapping: npm undici's

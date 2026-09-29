@@ -19,6 +19,7 @@ import { AsyncLocalStorage } from 'node:async_hooks'
 import { Agent, ProxyAgent, type Dispatcher } from 'undici'
 
 import type { ExitPool } from './pool.ts'
+import { laneNodeOf, type LaneBinding } from './lanes.ts'
 
 /** Structural seam over npm undici so tests can inject fakes. */
 export interface UndiciSeam {
@@ -70,9 +71,26 @@ export interface PoolRoutingOptions {
   /**
    * Ports-follow-use seam (docs 1.2.3): the local sing-box child exists
    * only while in use, so a picked local exit may be down right now. Only
-   * consulted for loopback exits.
+   * consulted for local exits (loopback and lane-backed).
    */
   localExit?: LocalExitHooks
+  /**
+   * Lane table (docs 1.2.4): a lane-backed exit (`lane:<nodeKey>`) carries
+   * no port of its own — a lane is assigned (clash selector switch) at dial
+   * time. Without the seam (tests / legacy wiring) lane exits serve direct.
+   */
+  lanes?: LanePoolSeam
+}
+
+/** Structural view of LanePool the dispatcher consumes — kept tiny so tests
+ *  can hand-roll a fake without pulling the whole table in. */
+export interface LanePoolSeam {
+  /** Synchronous fast path: the node already owns a lane (inFlight++). */
+  tryAcquire(nodeKey: string): LaneBinding | null
+  /** Full path: bind via selector switch, or wait for a free lane. */
+  acquire(nodeKey: string): Promise<LaneBinding | null>
+  /** Holders on one lane (diagnostics / tests). */
+  inFlight(port: number): number
 }
 
 /**
@@ -119,6 +137,31 @@ export function exitProxyUri(exitId: string, protocol: 'http' | 'socks5'): strin
 }
 
 /**
+ * Proxy wrapper that returns a lane to the table when the dispatch reaches a
+ * terminal callback (docs 1.2.4). A Proxy (not a copy) because undici
+ * handlers carry prototype state that a spread would strip (see #observe).
+ * The terminal set mirrors where #observe ends a dispatch: response end,
+ * response error (also the silence sentinel's synthesized error) and
+ * protocol upgrade (the stream hands off to the socket).
+ */
+function wrapLaneRelease(handler: Dispatcher.DispatchHandler, release: () => void): Dispatcher.DispatchHandler {
+  const terminal = new Set(['onResponseEnd', 'onResponseError', 'onRequestUpgrade'])
+  return new Proxy(handler as object, {
+    get(target, property) {
+      const value = Reflect.get(target, property)
+      if (typeof value !== 'function' || !terminal.has(String(property))) return value
+      return (...args: unknown[]): unknown => {
+        try {
+          return (value as (...a: unknown[]) => unknown).apply(target, args)
+        } finally {
+          release()
+        }
+      }
+    },
+  }) as Dispatcher.DispatchHandler
+}
+
+/**
  * The undici Dispatcher surface `fetch` actually calls (the subset
  * dsh-llm-proxy's RoutingDispatcher implements — full `Dispatcher` carries
  * 20+ stream helpers we never hit through fetch).
@@ -144,6 +187,12 @@ export class PoolRoutingDispatcher implements RoutingDispatcherSurface {
   #agentsOrder: string[] = []
   #closed = false
   #localExit?: LocalExitHooks
+  #lanes?: LanePoolSeam
+  /** Per-lane ProxyAgents keyed by port; epoch-invalidated on rebind
+   *  (docs 1.2.4). Bounded by K — no LRU needed. */
+  #laneAgents = new Map<number, { epoch: number; agent: Dispatcher }>()
+  /** Live lane holds, force-returned on destroy(). */
+  #laneHolds = new Set<() => void>()
 
   constructor(options: PoolRoutingOptions) {
     this.#pool = options.pool
@@ -156,6 +205,7 @@ export class PoolRoutingDispatcher implements RoutingDispatcherSurface {
     this.#headersMs = options.headersMs ?? 10_000
     this.#logger = options.logger
     this.#localExit = options.localExit
+    this.#lanes = options.lanes
     this.#direct = new options.undici.Agent()
   }
 
@@ -228,6 +278,37 @@ export class PoolRoutingDispatcher implements RoutingDispatcherSurface {
       // Pool unusable (empty / all cooling): direct, never fail closed (3.3).
       return this.#direct.dispatch(options, handler)
     }
+    // Lane-backed exit (docs 1.2.4): no per-node port — the lane must be
+    // assigned before any byte flows. Child down -> wake + serve direct
+    // (never fail closed, 3.3); lane busy -> wait for a free one; no lane
+    // frees or the selector switch fails -> direct.
+    const laneNode = laneNodeOf(exitId)
+    if (laneNode !== null) {
+      if (this.#localExit !== undefined && !this.#localExit.isRunning()) {
+        this.#localExit.onDown(exitId)
+        return this.#direct.dispatch(options, handler)
+      }
+      this.#localExit?.onUse(exitId)
+      if (this.#lanes === undefined) return this.#direct.dispatch(options, handler)
+      const fast = this.#lanes.tryAcquire(laneNode)
+      if (fast !== null) return this.#dispatchLane(exitId, fast, options, handler, model, session)
+      void this.#lanes
+        .acquire(laneNode)
+        .then((binding) => {
+          if (binding === null) {
+            this.#direct.dispatch(options, handler)
+            return
+          }
+          if (this.#closed) {
+            binding.release()
+            handler.onResponseError?.({} as Dispatcher.DispatchController, new Error('opencode2dsh: routing dispatcher closed'))
+            return
+          }
+          this.#dispatchLane(exitId, binding, options, handler, model, session)
+        })
+        .catch(() => this.#direct.dispatch(options, handler))
+      return true
+    }
     const agent = this.#agentFor(exitId)
     if (!agent) {
       return this.#direct.dispatch(options, handler)
@@ -243,6 +324,67 @@ export class PoolRoutingDispatcher implements RoutingDispatcherSurface {
       this.#localExit.onUse(exitId)
     }
     return agent.dispatch(options, this.#observe(exitId, model, session, handler))
+  }
+
+  /** The ProxyAgent for one lane: `socks5://127.0.0.1:<lanePort>`. Cached
+   *  per port and epoch-invalidated on rebind, so a stale cache entry can
+   *  never send a request through a lane that now serves another node. */
+  #laneAgentFor(binding: LaneBinding): Dispatcher | null {
+    const cached = this.#laneAgents.get(binding.port)
+    if (cached !== undefined && cached.epoch === binding.epoch) return cached.agent
+    if (cached !== undefined) {
+      this.#laneAgents.delete(binding.port)
+      void cached.agent.destroy().catch(() => {})
+    }
+    try {
+      const seam = this.#undici
+      const agent = new seam.ProxyAgent({
+        uri: `socks5://127.0.0.1:${binding.port}`,
+        clientFactory: (origin: URL | string, opts?: unknown) =>
+          new seam.Agent({ ...(opts as object), pipelining: 0 }),
+      })
+      this.#laneAgents.set(binding.port, { epoch: binding.epoch, agent })
+      return agent
+    } catch (err) {
+      this.#logger?.warn(`opencode2dsh: failed to build lane agent for port ${binding.port}: ${err instanceof Error ? err.message : String(err)}`)
+      return null
+    }
+  }
+
+  /** Dispatch through an assigned lane: the passive observer sits on top of
+   *  the raw handler, and a terminal callback (or dispatch failure) returns
+   *  the lane to the table exactly once — the silence sentinel counts as a
+   *  terminal too (it synthesizes onResponseError). */
+  #dispatchLane(
+    exitId: string,
+    binding: LaneBinding,
+    options: Dispatcher.DispatchOptions,
+    handler: Dispatcher.DispatchHandler,
+    model: string,
+    session: string,
+  ): boolean {
+    const agent = this.#laneAgentFor(binding)
+    if (agent === null) {
+      binding.release()
+      return this.#direct.dispatch(options, handler)
+    }
+    let released = false
+    const release = (): void => {
+      if (released) return
+      released = true
+      this.#laneHolds.delete(release)
+      binding.release()
+    }
+    this.#laneHolds.add(release)
+    // Release hook on BOTH layers, sharing the once-flag: the inner wrap
+    // catches what #observe emits toward the raw handler (the silence
+    // sentinel synthesizes onResponseError straight onto it), the outer
+    // wrap catches agent-level terminals even when the raw handler does not
+    // implement the method itself.
+    const observed = this.#observe(exitId, model, session, wrapLaneRelease(handler, release))
+    const ok = agent.dispatch(options, wrapLaneRelease(observed, release))
+    if (!ok) release()
+    return ok
   }
 
   /**
@@ -378,15 +520,28 @@ export class PoolRoutingDispatcher implements RoutingDispatcherSurface {
 
   close(): Promise<void> {
     this.#closed = true
-    const jobs = [this.#direct.close(), ...[...this.#agents.values()].map((a) => a.close())]
+    const jobs = [
+      this.#direct.close(),
+      ...[...this.#agents.values()].map((a) => a.close()),
+      ...[...this.#laneAgents.values()].map((l) => l.agent.close()),
+    ]
     return Promise.all(jobs).then(() => undefined)
   }
 
   destroy(): Promise<void> {
     this.#closed = true
-    const jobs = [this.#direct.destroy(), ...[...this.#agents.values()].map((a) => a.destroy())]
+    // Force-return every lane hold: after destroy no callback will arrive,
+    // so waiting for terminals would pin lanes forever (docs 1.2.4).
+    for (const release of [...this.#laneHolds]) release()
+    this.#laneHolds.clear()
+    const jobs = [
+      this.#direct.destroy(),
+      ...[...this.#agents.values()].map((a) => a.destroy()),
+      ...[...this.#laneAgents.values()].map((l) => l.agent.destroy()),
+    ]
     this.#agents.clear()
     this.#agentsOrder = []
+    this.#laneAgents.clear()
     return Promise.all(jobs).then(() => undefined)
   }
 }

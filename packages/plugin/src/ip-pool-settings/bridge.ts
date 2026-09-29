@@ -74,6 +74,9 @@ export interface PoolStatusView {
   /** Ports follow use (docs 1.2.3): local sing-box child up right now —
    *  false proves the disable/idle path released every local port. */
   singBoxRunning: boolean
+  /** Lane budget (docs 1.2.4): K lane ports + 1 clash API port, any node
+   *  count — the port ceiling the child may hold while running. */
+  lanes: { count: number; ports: number[]; apiPort: number }
   /** Non-empty when the pool runs but the routing layer deferred to another
    *  dispatcher-level plugin (R1 coexistence policy). */
   deferredReason: string
@@ -124,6 +127,7 @@ export function buildStatusView(
   return {
     enabled: runtime !== null && runtime.installer.enabled,
     singBoxRunning: runtime?.singBoxRunning === true,
+    lanes: runtime?.laneInfo ?? { count: 0, ports: [], apiPort: 0 },
     deferredReason: runtime !== null && !runtime.installer.enabled
       ? (runtime.installer as unknown as { deferredReason?: string }).deferredReason ?? ''
       : '',

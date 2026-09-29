@@ -18,7 +18,7 @@ function served(over: Partial<IpPoolSettingsValue> = {}): IpPoolSettingsValue {
     free: { enabled: true, targetSize: 20, blockedCountries: ['CN'] },
     manual: [],
     subscription: { urls: [], refreshMs: 30 * 60_000 },
-    singbox: { path: 'sing-box', idleStopMs: 600_000 },
+    singbox: { path: 'sing-box', idleStopMs: 600_000, lanes: 16 },
     pinnedExitId: '',
     pinnedStrict: false,
     proxyHosts: [],
@@ -38,6 +38,7 @@ function form(over: Partial<FormState> = {}): FormState {
     refreshMs: String(30 * 60_000),
     singboxPath: 'sing-box',
     singboxIdleStopMs: '600000',
+    singboxLanes: '16',
     pinnedExitId: '',
     pinnedStrict: false,
     probeModels: [],
@@ -62,20 +63,25 @@ test('an untouched draft produces no writes', () => {
 })
 
 test('reverting idleStopMs to the default still writes (the old base-skip swallowed it)', () => {
-  const value = served({ singbox: { path: 'sing-box', idleStopMs: 120_000 } })
+  const value = served({ singbox: { path: 'sing-box', idleStopMs: 120_000, lanes: 16 } })
   const writes = diffWrites(form({ singboxIdleStopMs: '600000' }), value)
-  assert.deepEqual(writes, [{ field: 'singbox', op: 'set', value: { path: 'sing-box', idleStopMs: 600_000 } }])
+  assert.deepEqual(writes, [{ field: 'singbox', op: 'set', value: { path: 'sing-box', idleStopMs: 600_000, lanes: 16 } }])
 })
 
-test('a singbox edit writes path and idleStopMs together', () => {
+test('a singbox edit writes path, idleStopMs and lanes together', () => {
   const writes = diffWrites(form({ singboxIdleStopMs: '120000' }), served())
-  assert.deepEqual(writes, [{ field: 'singbox', op: 'set', value: { path: 'sing-box', idleStopMs: 120_000 } }])
+  assert.deepEqual(writes, [{ field: 'singbox', op: 'set', value: { path: 'sing-box', idleStopMs: 120_000, lanes: 16 } }])
+})
+
+test('a lanes edit lands as a singbox write (docs 1.2.4)', () => {
+  const writes = diffWrites(form({ singboxLanes: '8' }), served())
+  assert.deepEqual(writes, [{ field: 'singbox', op: 'set', value: { path: 'sing-box', idleStopMs: 600_000, lanes: 8 } }])
 })
 
 test('the off flip and an idle edit land as ordered writes', () => {
   const writes = diffWrites(form({ enabled: false, singboxIdleStopMs: '300000' }), served({ enabled: true }))
   assert.deepEqual(writes, [
     { field: 'enabled', op: 'set', value: false },
-    { field: 'singbox', op: 'set', value: { path: 'sing-box', idleStopMs: 300_000 } },
+    { field: 'singbox', op: 'set', value: { path: 'sing-box', idleStopMs: 300_000, lanes: 16 } },
   ])
 })

@@ -108,7 +108,7 @@ design.md §9.2 曾把「多出口」定为灰色能力并默认关闭（当时�
 
 所以加密节点走「外部核心转换成本地 SOCKS5，再按明文处理」的路线，与 GoProxy 的 sing-box 用法完全同构。转换核心二选一，设置页自动探测（有哪个用哪个，都无则明文照常、加密节点标「待转换」灰显）：
 
-1. **sing-box standalone**（官方二进制，用户自装，`sing-box` 在 PATH）：我们生成最小 config（每节点一个本地 SOCKS5 入站，端口 30000+ 递增——GoProxy singbox.go 同构），spawn 为子进程，按需重载。**这是本插件唯一会 spawn 的外部进程**：用户显式配置订阅加密节点才拉起；「spawn 外部已有二进制」与「打包原生二进制进 npm 包」是两回事，后者才是被淘汰的分发问题（§1.4）。
+1. **sing-box standalone**（官方二进制，用户自装，`sing-box` 在 PATH）：我们生成最小 config（K 个本地 SOCKS5 车道入站 + 全部节点出站挂 selector，端口 30001+ 车道数——§1.2.4 端口上限，取代最初的「每节点一入站、30000+ 递增」GoProxy 同构形状），spawn 为子进程，按需重载。**这是本插件唯一会 spawn 的外部进程**：用户显式配置订阅加密节点才拉起；「spawn 外部已有二进制」与「打包原生二进制进 npm 包」是两回事，后者才是被淘汰的分发问题（§1.4）。
 2. ~~**GoProxy 实例**~~（原选项 2，2026-09-05 摘牌）：内建能力覆盖后残余价值归零（§1.2）；外部核心只剩 sing-box standalone 一条路。
 
 **「我们历史上外挂过 Go（legacy/ sidecar），是不是自己写个 Go 端更好做？」——不。要外挂的是 sing-box 这个进程，不是「我们的 Go」**
@@ -126,9 +126,9 @@ design.md §9.2 曾把「多出口」定为灰色能力并默认关闭（当时�
 
 **为什么轮换必须自己托管 sing-box、不能借道用户的 Clash（深层理由：可寻址性，不只是协议拨号）**
 
-「每节点一个本地端口」买的不是「能拨加密协议」这一件事，而是**轮换引擎的全部语义前提**：
+「每节点可寻址」（§1.2.2；2026-09-30 起由车道绑定实现，见 §1.2.4）买的不是「能拨加密协议」这一件事，而是**轮换引擎的全部语义前提**：
 
-| 轮换语义 | 经自托管 sing-box（每节点一端口） | 经 Clash 混合端口（7897） |
+| 轮换语义 | 经自托管 sing-box（每节点可寻址） | 经 Clash 混合端口（7897） |
 | --- | --- | --- |
 | 指定「这次请求走节点 X」 | ✅ 请求 → X 的专属端口 | ❌ 单端点，节点选择权在 Clash 手里 |
 | 出口 IP 可知且稳定 | ✅ 探活拿到 X 的真实 exitIP，路由键成立 | ❌ Clash 自动切换/负载均衡后 exitIP 随时变，健康表无法按 IP 维度积累 |
@@ -153,6 +153,42 @@ design.md §9.2 曾把「多出口」定为灰色能力并默认关闭（当时�
 
 状态可观测：桥 `/status` 与设置页状态行暴露 `singBoxRunning`（「sing-box 运行中」/「sing-box 未运行 · 本地端口已释放」），关闭后立刻能看到端口确实回收了。子进程只在 `singbox.path` 配置且订阅 URL 非空时存在，因此本机无 sing-box / 无订阅的用户与本节无关（明文节点、手填、pinned 走 undici 原生路径，零本地端口）。
 
+#### 1.2.4 车道化（K lanes + selector 热切换）：端口上限与「人人可探、人人可选」
+
+§1.2.2 的「每节点一个入站」把 260 个节点变成了 260 个常驻端口（30001-30262 全段占满）；§1.2.3 管住了这些端口的**生命周期**，但管不住它们的**数量**——端口占用本身就是冗余。用户决策（2026-09-30）：「只在真正要使用时才占用端口」进一步收紧为**恒定的小端口预算**。方案 K 车道 + selector 热切换（人工验证过全部五条保证后定稿）：
+
+**配置形状**（`generateConfig(nodes, basePort, lanes=16)`）：
+
+- **K 个 socks 入站** `lane0..laneK-1`，端口 `basePort+1 .. basePort+K`（默认 30001-30016）——只有这 K 个端口会存在；
+- **N 个 node outbound**（`out-<nodeKey>` 派生稳定 tag，内容寻址、刷新不漂移）**不占任何端口**；
+- **K 个 selector**（`sel-lane<i>`），每个成员 = 全部 node outbound + `direct`，逐车道一条路由规则 `lane<i> → sel-lane<i>`，`route.final = direct`；
+- `experimental.clash_api.external_controller = 127.0.0.1:<basePort+K+1>`（默认 30017）——第 K+1 个端口，也是唯一额外端口；
+- 显式 `{"type":"direct","tag":"direct"}` 出站（缺它 FATAL "default outbound not found: direct"）。
+
+**端口占用恒等于 K + 1（默认 17），与节点数无关**；且这 17 个端口也只在子进程存活期间存在（§1.2.3 原样生效：关池/闲置照样归零）。
+
+**运行时模型 `LanePool`**（`src/pool/lanes.ts`，主管子进程持有）：
+
+| 概念 | 实现 |
+| --- | --- |
+| 池 id | `lane:<nodeKey>`（如 `lane:shadowsocks:1.2.3.4:443`）——无端口语义、稳定去重键 |
+| 绑定 | `acquire(nodeKey)`：已绑 → 同步 fast path（`tryAcquire`，热路径零 IO）；未绑 → 选空闲车道（优先从未用过的，否则 LRU）→ `PUT /proxies/sel-lane<i>` `{"name":"out-…"} `毫秒级切换 → 授予 `{port, epoch, release}`；全忙 → 排队等 release（10s 死线后 null，调用方直连兜底） |
+| epoch | 每次 configure/reset 单调递增 + 每次重绑自增；dispatcher 的车道 agent 缓存按 `port+epoch` 键控——车道换节点必换 agent，旧连接池永不复用 |
+| 释放 | dispatcher 在响应终止回调（onResponseEnd/onResponseError/onRequestUpgrade，双层包装共享 once 标志）与 `destroy()` 时 `release()`；admission 在探针 finally 释放 |
+| 失败 | 切换失败/无空闲/子进程不在 → 返回 null → **直连兜底（§3.3 never-fail-closed），绝不因车道而失败** |
+
+**三条用户保证**（答案都是「能」，且不存在「未挂载节点」概念——N 个 outbound 常驻配置，车道只决定此刻谁在拨号）：
+
+1. **能被探测**——准入/探活借任意空闲车道（`bindLane`：先 `ensureLocalRunning` 拉子进程，再 acquire，探完 finally 释放）；并发受 prober 队列（默认 3）+ 车道数双重约束；
+2. **能被选择**——路由 pick 中 `lane:` id → fast path 直接拨已绑车道，未绑则异步 acquire 后再拨（dispatch 先返回 true，不阻塞事件循环）；
+3. **全员出问题时能换池子里任何一个**——轮换/冷却释放车道后，任意健康节点 `acquire` 即切上，毫秒级、不断在飞连接（keep-alive 实测：切换只影响新拨号，同连接续传不受影响）。
+
+**生命周期集成**：`reload` 重生配置时 `lanes.configure(...)`（`sameNodes` 幂等检查加上车道数 K——K 变了必须重生）；子进程 stop/崩溃 → `lanes.reset()`（epoch 作废，一切绑定失效）；设置页改 `singbox.lanes` → `setLaneCount` 立即 respawn（与换节点清单同契约：掉在飞连接）。
+
+**设置项**：`singbox.lanes`（1-64，默认 16）。状态可观测：桥 `/status.lanes = {count, ports, apiPort}`，设置页状态行显示「16 车道 / 30017」。
+
+**与 §1.2.2 的差异声明**：「每节点一个本地 SOCKS5 入站、端口 30000+ 递增」（GoProxy 同构）已由本节取代为「K 车道 + N 出站 + K selector」；轮换语义表（§1.2.2 末）逐条不变——可寻址性从「专属端口」改由「专属车道绑定」提供，按请求粒度且不碰任何用户侧 Clash。
+
 ### 1.3 从 GoProxy 吸取什么：抄「设计」，不接「实例」（对接已于 2026-09-05 摘牌）
 
 两问分开答：
@@ -168,7 +204,7 @@ design.md §9.2 曾把「多出口」定为灰色能力并默认关闭（当时�
 | `pool/manager.go` 四态状态机 | `ExitPool` 的 refill 调度（§3.5） | determineState/NeedsFetch 的阈值思想照抄（emergency 全源强抓 / refill 快源补充 / healthy 不抓），双协议槽位简化为单池 |
 | `checker/` + `optimizer/` 定期巡检 | 周期探活（§4.3） | 已有对应设计，无需新抄 |
 | `custom/parser.go` 三格式订阅解析 | `src/pool/subscription.ts` 解析层（§1.2.1） | Parse/parseAutoDetect/parseClash/parseBase64/parsePlain 的结构与识别启发式照抄为 TS（纯文本处理，无 Go 依赖） |
-| `custom/singbox.go` 外部核心托管 | `src/pool/singbox.ts`（§1.2.2） | 「每节点一个本地 SOCKS5 入站、端口递增、按需重载」的托管模式照抄；子进程健康检查与软删除同构 |
+| `custom/singbox.go` 外部核心托管 | `src/pool/singbox.ts`（§1.2.2 + §1.2.4） | 外部核心托管模式（生成 config、spawn、按需重载、软删除同构）照抄；「每节点一入站」的端口形状已按本项目端口纪律改造为 K 车道 + selector（§1.2.4） |
 | `storage/` SQLite | 不抄 | 内存态（§3.2）；重启重抓可接受（免费源分钟级更新；订阅清单持久化在 settings） |
 
 **明确不抄的**：它的 WebUI/管理面与 SQLite。加密协议**栈本身**（vmess 密码学、TLS 指纹等）不自写——由 sing-box standalone 承担（§1.2.2）。
@@ -476,6 +512,7 @@ POST {zen}/v1/chat/completions
 | freeSourceEnabled | true | 免费源抓取总开关（关掉 = 只用 manual/subscription 来源） |
 | subscriptionRefreshMs | 30min | 订阅刷新间隔（拉 URL 重跑解析，断路器同免费源） |
 | singboxIdleStopMs | 600000（10min） | 本地端口空闲自动停止（§1.2.3 端口跟随使用；0 = 启用期间一直运行；关闭池子不受此值影响、立即释放） |
+| singboxLanes | 16 | 车道数 K（§1.2.4）：本地端口占用恒为 K+1（K 数据车道 + 1 clash API），与节点数无关；1-64，改动立即 respawn |
 | pinnedStrict | false | 绝对固定模式（§3.6）：true 时 pinned 失败透传、不换出口不直连 |
 
 全部进 settings namespace，设置页可调（maxConcurrentProbes 也开放：有些用户宁可慢也不并发）。
@@ -519,6 +556,7 @@ Config = Schema.object({
   singbox: Schema.object({                        // 加密节点转换核心（§1.2.2）
     path: Schema.string().default('sing-box'),    // sing-box 二进制路径（PATH 或绝对路径）
     idleStopMs: Schema.number().min(0).default(600000),  // 端口跟随使用的空闲停机阈值（§1.2.3；0 = 一直运行）
+    lanes: Schema.number().min(1).max(64).default(16),   // 车道数 K：端口占用恒为 K+1（§1.2.4；改动 respawn）
   }),
   pinnedExitId: Schema.string().default(''),       // 固定主力出口（§3.6；出口列表行内设置或此处直填地址）
   pinnedStrict: Schema.boolean().default(false), // true = 绝对固定：失败也不换出口、不直连（§3.6 行为契约）

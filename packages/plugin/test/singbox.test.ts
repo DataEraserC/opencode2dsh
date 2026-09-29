@@ -88,36 +88,76 @@ test('buildOutbound: unknown types return null (skipped)', () => {
   }, 'out-x'), null)
 })
 
-test('generateConfig: per-node inbound/outbound/rule with ascending ports + direct default', () => {
+test('generateConfig: K lane inbounds + selectors + clash API (docs 1.2.4 port ceiling)', () => {
   const nodes = [vmessNode(), vmessNode({ name: 'second', server: 'v2.example.com', raw: { type: 'vmess', uuid: 'u2' } })]
-  const { config, portMap } = generateConfig(nodes, 30_000)
+  const { config, outTags, lanePorts, apiPort } = generateConfig(nodes, 30_000, 4)
   const cfg = config as {
     inbounds: Array<{ tag: string; listen: string; listen_port: number; type: string }>
-    outbounds: Array<{ tag: string; type: string }>
+    outbounds: Array<{ tag: string; type: string; outbounds?: string[]; default?: string }>
     route: { rules: Array<{ inbound: string[]; outbound: string }>; final: string }
+    experimental: { clash_api: { external_controller: string } }
   }
-  assert.deepEqual(cfg.inbounds.map((inbound) => inbound.listen_port), [30_001, 30_002])
+  // K lane ports, then the clash API port: 2 nodes hold 5 ports, not 2
+  assert.deepEqual(lanePorts, [30_001, 30_002, 30_003, 30_004])
+  assert.equal(apiPort, 30_005)
+  assert.equal(cfg.inbounds.length, 4)
   assert.ok(cfg.inbounds.every((inbound) => inbound.listen === '127.0.0.1' && inbound.type === 'socks'))
-  // direct default outbound appended last
-  assert.equal(cfg.outbounds[cfg.outbounds.length - 1]?.tag, 'direct')
+  assert.deepEqual(cfg.inbounds.map((inbound) => inbound.listen_port), lanePorts)
+  assert.deepEqual(cfg.inbounds.map((inbound) => inbound.tag), ['lane0', 'lane1', 'lane2', 'lane3'])
+  // 4 selectors + 2 node outbounds + direct
+  assert.equal(cfg.outbounds.length, 7)
+  const first = cfg.outbounds[0]!
+  assert.equal(first.type, 'selector')
+  assert.equal(first.tag, 'sel-lane0')
+  assert.equal(first.default, outTags.get(nodeKeyOf(nodes[0]!)))
+  assert.ok((first.outbounds ?? []).includes('direct'))
+  // route: every lane dials its own selector; final stays direct
+  assert.deepEqual(
+    cfg.route.rules,
+    lanePorts.map((_, i) => ({ inbound: [`lane${i}`], outbound: `sel-lane${i}` })),
+  )
   assert.equal(cfg.route.final, 'direct')
-  // rules wire each inbound to its outbound
-  assert.deepEqual(cfg.route.rules[0], { inbound: ['in-node-0'], outbound: 'out-node-0' })
-  // portMap keys are GoProxy node keys
-  assert.deepEqual([...portMap.values()], [30_001, 30_002])
-  assert.equal(portMap.get(nodeKeyOf(nodes[0]!)), 30_001)
+  assert.equal(cfg.outbounds[cfg.outbounds.length - 1]?.tag, 'direct')
+  assert.equal(cfg.experimental.clash_api.external_controller, '127.0.0.1:30005')
+  // nodeKey -> stable content-derived outbound tag (no index drift)
+  assert.equal(outTags.size, 2)
+  assert.equal(outTags.get(nodeKeyOf(nodes[0]!)), outTags.get('vmess:v.example.com:443'))
 })
 
-test('generateConfig: unsupported nodes are skipped without burning a port', () => {
+test('generateConfig: default lane budget is 16 (port ceiling K + 1, any node count)', () => {
+  const one = generateConfig([vmessNode()], 30_000)
+  const many = generateConfig(Array.from({ length: 60 }, (_, i) => vmessNode({ server: `n${i}.example.com` })), 30_000)
+  assert.equal(one.lanePorts.length, 16)
+  assert.equal(one.apiPort, 30_017)
+  assert.equal(many.lanePorts.length, 16)
+  assert.equal(many.apiPort, 30_017)
+  assert.equal(many.outTags.size, 60)
+})
+
+test('generateConfig: unsupported nodes are skipped without burning an outbound', () => {
   const nodes = [
     { name: 'bad', type: 'wireguard', server: 'x', port: 1, raw: {} },
     vmessNode(),
   ] satisfies ParsedNode[]
-  const { config, portMap } = generateConfig(nodes, 30_000)
-  const cfg = config as { inbounds: unknown[]; outbounds: unknown[] }
-  assert.equal(cfg.inbounds.length, 1)
-  assert.equal(cfg.outbounds.length, 2) // vmess + direct
-  assert.equal(portMap.size, 1)
+  const { config, outTags, lanePorts } = generateConfig(nodes, 30_000, 2)
+  const cfg = config as { inbounds: unknown[]; outbounds: Array<{ type: string; outbounds?: string[]; default?: string }> }
+  assert.equal(cfg.inbounds.length, 2) // lanes exist regardless
+  assert.equal(cfg.outbounds.length, 4) // 2 selectors + vmess + direct
+  assert.equal(outTags.size, 1)
+  assert.ok(lanePorts.length === 2)
+})
+
+test('generateConfig: all-unsupported node list still yields a runnable config (selectors fall back to direct)', () => {
+  const nodes = [{ name: 'bad', type: 'wireguard', server: 'x', port: 1, raw: {} }] satisfies ParsedNode[]
+  const { config, outTags } = generateConfig(nodes, 30_000, 3)
+  const cfg = config as { outbounds: Array<{ type: string; outbounds?: string[]; default?: string }> }
+  assert.equal(outTags.size, 0)
+  const selectors = cfg.outbounds.filter((out) => out.type === 'selector')
+  assert.equal(selectors.length, 3)
+  for (const selector of selectors) {
+    assert.deepEqual(selector.outbounds, ['direct'])
+    assert.equal(selector.default, 'direct')
+  }
 })
 
 // -- conversion pipeline (fetcher + supervisor seam) ---------------------------

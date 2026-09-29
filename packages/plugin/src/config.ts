@@ -77,6 +77,10 @@ export interface IpPoolConfig {
     /** Ports follow use (docs 1.2.3): stop the local sing-box child after
      *  this many ms with no pool use; 0 keeps it always-on while enabled. */
     idleStopMs?: number
+    /** Lane budget K (docs 1.2.4): how many local SOCKS5 ports the child
+     *  may open at once (1-64; default 16). Occupied ports = K + 1 clash API
+     *  regardless of node count. */
+    lanes?: number
   }
   /** Admission smoke model (docs 4.1 probeModels[0]). */
   probeModels?: string[]

@@ -71,7 +71,7 @@ export interface IpPoolSettingsValue {
   free: { enabled: boolean; targetSize: number; blockedCountries: string[] }
   manual: string[]
   subscription: { urls: string[]; refreshMs: number }
-  singbox: { path: string; idleStopMs: number }
+  singbox: { path: string; idleStopMs: number; lanes: number }
   pinnedExitId: string
   pinnedStrict: boolean
   proxyHosts: string[]
@@ -82,6 +82,8 @@ export interface PoolStatusView {
   enabled: boolean
   /** Ports follow use (docs 1.2.3): local sing-box child up right now. */
   singBoxRunning?: boolean
+  /** Lane budget (docs 1.2.4): K + clash API port count while running. */
+  lanes?: { count: number; ports: number[]; apiPort: number }
   deferredReason: string
   state: 'healthy' | 'warning' | 'critical' | 'emergency'
   total: number
@@ -133,7 +135,7 @@ const DEFAULTS: IpPoolSettingsValue = {
   free: { enabled: true, targetSize: 20, blockedCountries: ['CN'] },
   manual: [],
   subscription: { urls: [], refreshMs: 30 * 60_000 },
-  singbox: { path: 'sing-box', idleStopMs: 600_000 },
+  singbox: { path: 'sing-box', idleStopMs: 600_000, lanes: 16 },
   pinnedExitId: '',
   pinnedStrict: false,
   proxyHosts: [],
@@ -157,6 +159,7 @@ export interface FormState {
   refreshMs: string
   singboxPath: string
   singboxIdleStopMs: string
+  singboxLanes: string
   pinnedExitId: string
   pinnedStrict: boolean
   probeModels: string[]
@@ -174,6 +177,7 @@ function emptyForm(): FormState {
     refreshMs: String(DEFAULTS.subscription.refreshMs),
     singboxPath: DEFAULTS.singbox.path,
     singboxIdleStopMs: String(DEFAULTS.singbox.idleStopMs),
+    singboxLanes: String(DEFAULTS.singbox.lanes),
     pinnedExitId: '',
     pinnedStrict: DEFAULTS.pinnedStrict,
     probeModels: [],
@@ -192,6 +196,7 @@ function formFromValue(value: IpPoolSettingsValue): FormState {
     refreshMs: String(value.subscription.refreshMs),
     singboxPath: value.singbox.path,
     singboxIdleStopMs: String(value.singbox.idleStopMs),
+    singboxLanes: String(value.singbox.lanes),
     pinnedExitId: value.pinnedExitId,
     pinnedStrict: value.pinnedStrict,
     probeModels: [...value.probeModels],
@@ -600,6 +605,8 @@ function CardBody(props: { settings: ConfigPageForm | undefined; t: IpPoolCardPr
     if (!/^\d+$/.test(form.refreshMs.trim()) || refresh < 60_000) return t('invalidRange')
     const idle = Number(form.singboxIdleStopMs)
     if (!/^\d+$/.test(form.singboxIdleStopMs.trim()) || idle < 0) return t('invalidRange')
+    const lanes = Number(form.singboxLanes)
+    if (!/^\d+$/.test(form.singboxLanes.trim()) || lanes < 1 || lanes > 64) return t('invalidRange')
     for (const entry of form.manual) {
       if (!/^https?:\/\/[^\s:]+:\d{1,5}$|^socks5:\/\/[^\s:]+:\d{1,5}$|^socks5h?:\/\/\[[^\]]+\]:\d{1,5}$/.test(entry)) return t('invalidProxy')
     }
@@ -822,6 +829,9 @@ function CardBody(props: { settings: ConfigPageForm | undefined; t: IpPoolCardPr
             {t('sectionSubscription')}: {status.subscription.pendingConversion} 待转换 · {status.subscription.convertedAdmitted} 已转换入池
             {status.subscription.lastError !== '' ? ` · ${status.subscription.lastError}` : ''}
             {` · ${status.singBoxRunning === true ? t('singBoxRunning') : t('singBoxStopped')}`}
+            {status.singBoxRunning === true && (status.lanes?.count ?? 0) > 0
+              ? ` · ${status.lanes?.count} ${t('lanesUnit')} / ${status.lanes?.apiPort}`
+              : ''}
           </span>
         )}
         <TextField
@@ -839,6 +849,15 @@ function CardBody(props: { settings: ConfigPageForm | undefined; t: IpPoolCardPr
           min={0}
           testId="field-singboxIdleStopMs"
           onChange={(value) => { setSaved(false); setForm({ ...form, singboxIdleStopMs: value }) }}
+        />
+        <TextField
+          label={t('singboxLanes')}
+          hint={t('singboxLanesHint')}
+          value={form.singboxLanes}
+          type="number"
+          min={1}
+          testId="field-singboxLanes"
+          onChange={(value) => { setSaved(false); setForm({ ...form, singboxLanes: value }) }}
         />
       </div>
 

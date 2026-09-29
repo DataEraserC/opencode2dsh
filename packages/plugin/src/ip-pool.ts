@@ -18,12 +18,13 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 
 import { ExitPool, gradeOf, type ExitNode } from './pool/pool.ts'
-import type { LocalExitHooks, UndiciSeam } from './pool/dispatcher.ts'
+import type { LanePoolSeam, LocalExitHooks, UndiciSeam } from './pool/dispatcher.ts'
 import type { AdmissionDeps } from './pool/admission.ts'
 import { Prober } from './pool/prober.ts'
 import { RefillScheduler } from './pool/refill.ts'
 import { SubscriptionFetcher } from './pool/subscription-fetcher.ts'
-import { SingBoxSupervisor } from './pool/singbox.ts'
+import { DEFAULT_LANES, SingBoxSupervisor } from './pool/singbox.ts'
+import { laneNodeOf } from './pool/lanes.ts'
 import { createRotateDelegate, setRotateDelegate } from './pool/rotate.ts'
 
 /** Data dir shared with the catalog cache (config.ts convention). */
@@ -117,6 +118,9 @@ export interface IpPoolRuntime {
   /** Ports follow use (docs 1.2.3): local sing-box child up right now —
    *  status bridge evidence that disable/idle actually released the ports. */
   readonly singBoxRunning: boolean
+  /** Lane budget (docs 1.2.4): K ports + clash API, independent of node
+   *  count — status bridge evidence for the port ceiling. */
+  readonly laneInfo: { count: number; ports: number[]; apiPort: number }
   /** Hot-apply one committed settings value onto the live runtime (docs §5.1).
    *  Every knob lands without restart; enabled toggles the dispatcher. */
   reconfigure(next: Opencode2dshConfig): Promise<void>
@@ -182,7 +186,7 @@ export async function startIpPool(
     try {
       const exits = await s.ensureRunning()
       if (!wasRunning && exits.length > 0) {
-        logger.info(`opencode2dsh: sing-box started on demand — ${exits.length} local port(s) opened`)
+        logger.info(`opencode2dsh: sing-box started on demand — ${exits.length} node(s) over ${s.laneInfo.count} lane(s)`)
       }
     } catch (err) {
       logger.warn(`opencode2dsh: on-demand sing-box start failed (${err instanceof Error ? err.message : String(err)})`)
@@ -196,11 +200,32 @@ export async function startIpPool(
     onUse: () => touchLocal(),
   }
 
+  // Lane seam (docs 1.2.4): the dispatcher and admission bind through the
+  // supervisor's table; both resolve it lazily (the supervisor is created
+  // on demand) and treat "no supervisor" as "no lane" (direct / soft fail).
+  const laneSeam: LanePoolSeam = {
+    tryAcquire: (nodeKey) => supervisor?.lanes.tryAcquire(nodeKey) ?? null,
+    acquire: (nodeKey) => supervisor?.lanes.acquire(nodeKey) ?? Promise.resolve(null),
+    inFlight: (port) => supervisor?.lanes.inFlight(port) ?? 0,
+  }
+  const bindLane = async (address: string): Promise<{ address: string; release(): void } | null> => {
+    const nodeKey = laneNodeOf(address)
+    if (nodeKey === null) return null
+    // The lanes and the clash API live inside the child — wake it first.
+    await ensureLocalRunning()
+    const s = supervisor
+    if (s === undefined || !s.running) return null
+    const binding = await s.lanes.acquire(nodeKey)
+    if (binding === null) return null
+    return { address: `127.0.0.1:${binding.port}`, release: binding.release }
+  }
+
   const installer = new RoutingInstaller({
     pool,
     undici,
     proxyHosts: ipPool.proxyHosts,
     localExit,
+    lanes: laneSeam,
     logger,
   })
 
@@ -211,6 +236,7 @@ export async function startIpPool(
     blockedCountries: ipPool.free?.blockedCountries,
     smokeModel: (ipPool.probeModels ?? [])[0],
     ensureLocalEndpoints: ensureLocalRunning,
+    bindLane,
   }
   const probeModels = ipPool.probeModels ?? []
   const prober = new Prober({ pool, maxConcurrentProbes: ipPool.maxConcurrentProbes ?? 3 })
@@ -230,6 +256,7 @@ export async function startIpPool(
       supervisor = new SingBoxSupervisor({
         binPath: singboxPath,
         dataDir: join(dataDir(), 'singbox'),
+        lanes: config.ipPool?.singbox?.lanes ?? DEFAULT_LANES,
         logger,
       })
     } else {
@@ -439,6 +466,10 @@ export async function startIpPool(
     get subscriptions() { return subscriptions },
     get refill() { return refill },
     get singBoxRunning(): boolean { return supervisor?.running === true },
+    /** Lane budget for diagnostics (status bridge, docs 1.2.4). */
+    get laneInfo() {
+      return supervisor?.laneInfo ?? { count: 0, ports: [], apiPort: 0 }
+    },
     async reconfigure(next: Opencode2dshConfig) {
       const wasEnabled = config.ipPool?.enabled !== false
       // splice the new ipPool section into the config object the runtime closes over
@@ -449,6 +480,15 @@ export async function startIpPool(
       applyConfig()
       // rotate ceiling is live-tunable (settings page) — rebuild the delegate
       setRotateDelegate(createRotateDelegate(pool, { maxAttempts: next.ipPool?.maxRotateAttempts ?? 3 }))
+      // Lane budget (docs 1.2.4): a changed K changes the config shape, so
+      // the child respawns right away (in-flight streams drop — same
+      // contract as a node refresh) instead of waiting for the next fetch.
+      const laneSupervisor = supervisor
+      if (laneSupervisor !== undefined && laneSupervisor.setLaneCount(next.ipPool?.singbox?.lanes ?? DEFAULT_LANES)) {
+        void laneSupervisor.ensureRunning().catch((err: unknown) => {
+          logger.warn(`opencode2dsh: respawn for lanes change failed (${err instanceof Error ? err.message : String(err)})`)
+        })
+      }
       // Dispatcher install state follows enabled + pool occupancy. Every
       // enable flip re-attempts install: when another dispatcher-level plugin
       // owned the slot (R1 deferral), its unload is picked up here without a

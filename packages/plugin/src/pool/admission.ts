@@ -22,6 +22,7 @@ import { ZEN_BASE_URL } from '../adapter/catalog.ts'
 import { FREE_LANE_GATE_TOOL_NAMES, freeLaneGateTool } from '../adapter/messages.ts'
 import { canonicalSessionID, disguiseHeaders, opencodeUserAgent, randomID, stableID } from '../adapter/ids.ts'
 import { isLoopback } from './dispatcher.ts'
+import { laneNodeOf } from './lanes.ts'
 import { gradeOf, type ExitNode, type ExitPool } from './pool.ts'
 
 export interface AdmissionDeps {
@@ -44,6 +45,14 @@ export interface AdmissionDeps {
    * its port. Only invoked when the candidate address is loopback.
    */
   ensureLocalEndpoints?: () => Promise<void>
+  /**
+   * Lane binding (docs 1.2.4): called for `lane:` candidates — brings the
+   * child up, assigns a free lane (clash selector switch) and returns the
+   * real `127.0.0.1:<lanePort>` to dial plus a release for the finally.
+   * Null = no lane free / switch failed -> admission fails soft (reason).
+   * Missing dep: `lane:` candidates fail with lane-bind-missing.
+   */
+  bindLane?: (address: string) => Promise<{ address: string; release(): void } | null>
   logger?: { warn(message: string): void }
 }
 
@@ -194,10 +203,19 @@ export async function admitCandidate(
     echoFacts?: EchoFacts
   } = {},
 ): Promise<AdmissionResult> {
-  // Ports follow use (docs 1.2.3): a loopback candidate is a local converted
-  // exit — make sure the child is running before the first byte goes at the
-  // port (no-op for external hosts and while the core is already up).
-  if (deps.ensureLocalEndpoints !== undefined && isLoopback(candidate.address)) {
+  // Ports follow use (docs 1.2.3) + lanes (1.2.4): a loopback candidate is
+  // a local endpoint of the child — wake it first. A `lane:` candidate has
+  // no endpoint yet — bind one (child up + selector switch) and dial the
+  // lane it lands on; everything else is external (no local call).
+  let dialAddress = candidate.address
+  let laneRelease: (() => void) | null = null
+  if (laneNodeOf(candidate.address) !== null) {
+    if (deps.bindLane === undefined) return { admitted: false, reason: 'lane-bind-missing' }
+    const bound = await deps.bindLane(candidate.address)
+    if (bound === null) return { admitted: false, reason: 'lane-busy' }
+    dialAddress = bound.address
+    laneRelease = () => bound.release()
+  } else if (deps.ensureLocalEndpoints !== undefined && isLoopback(candidate.address)) {
     await deps.ensureLocalEndpoints()
   }
   const zenBase = deps.zenBaseUrl ?? ZEN_BASE_URL
@@ -222,9 +240,10 @@ export async function admitCandidate(
   let agent: Dispatcher | null = null
   try {
     agent = new deps.undici.ProxyAgent({
-      uri: candidate.protocol === 'socks5' ? `socks5://${candidate.address}` : `http://${candidate.address}`,
+      uri: candidate.protocol === 'socks5' ? `socks5://${dialAddress}` : `http://${dialAddress}`,
     })
   } catch (err) {
+    laneRelease?.()
     return { admitted: false, reason: `agent-build: ${err instanceof Error ? err.message : String(err)}` }
   }
 
@@ -243,7 +262,9 @@ export async function admitCandidate(
     if (options.echoFacts) {
       facts = options.echoFacts
     } else {
-      const verdict = await coarseScreen(deps, candidate, options)
+      // coarseScreen builds its own per-request ProxyAgent — hand it the
+      // LANEdial address, never the `lane:` id (an id carries no port).
+      const verdict = await coarseScreen(deps, { ...candidate, address: dialAddress }, options)
       if ('rejected' in verdict) return { admitted: false, reason: verdict.rejected }
       facts = verdict
     }
@@ -323,6 +344,7 @@ export async function admitCandidate(
     return { admitted: false, reason: err instanceof Error ? err.message : String(err) }
   } finally {
     void agent.close().catch(() => {})
+    laneRelease?.()
   }
 }
 

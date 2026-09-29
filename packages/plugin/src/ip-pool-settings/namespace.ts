@@ -91,6 +91,8 @@ export const IpPoolConfigSchema = Schema.object({
     path: Schema.string().default('sing-box'),
     /** Ports follow use (docs 1.2.3): idle auto-stop of the local child (ms; 0 = always-on). */
     idleStopMs: Schema.number().min(0).step(1).default(600_000),
+    /** Lane budget K (docs 1.2.4): local ports = K + 1 clash API, any node count. */
+    lanes: Schema.number().min(1).max(64).step(1).default(16),
   }),
   /** Fixed primary exit address (docs §3.6). */
   pinnedExitId: Schema.string().default(''),
@@ -110,7 +112,7 @@ export interface IpPoolSettings {
   free: { enabled: boolean; targetSize: number; blockedCountries: string[] }
   manual: string[]
   subscription: { urls: string[]; refreshMs: number }
-  singbox: { path: string; idleStopMs: number }
+  singbox: { path: string; idleStopMs: number; lanes: number }
   pinnedExitId: string
   pinnedStrict: boolean
   proxyHosts: string[]
@@ -174,7 +176,7 @@ export function resolveIpPoolSettings(value: AnyIpPoolSection | undefined): IpPo
       urls,
       refreshMs: raw.subscription?.refreshMs ?? 30 * 60_000,
     },
-    singbox: { path: raw.singbox?.path ?? 'sing-box', idleStopMs: raw.singbox?.idleStopMs ?? 600_000 },
+    singbox: { path: raw.singbox?.path ?? 'sing-box', idleStopMs: raw.singbox?.idleStopMs ?? 600_000, lanes: raw.singbox?.lanes ?? 16 },
     pinnedExitId: raw.pinnedExitId ?? '',
     pinnedStrict: raw.pinnedStrict ?? false,
     proxyHosts: raw.proxyHosts ?? [],
@@ -196,7 +198,7 @@ export function toIpPoolConfig(value: IpPoolSettings): {
   free: { enabled: boolean; targetSize: number; blockedCountries: string[] }
   subscriptions: string[]
   subscription: { refreshMs: number }
-  singbox: { path: string; idleStopMs: number }
+  singbox: { path: string; idleStopMs: number; lanes: number }
   probeModels: string[]
   maxConcurrentProbes: number
   maxRotateAttempts: number
@@ -214,7 +216,7 @@ export function toIpPoolConfig(value: IpPoolSettings): {
     },
     subscriptions: value.subscription.urls,
     subscription: { refreshMs: value.subscription.refreshMs },
-    singbox: { path: value.singbox.path, idleStopMs: value.singbox.idleStopMs },
+    singbox: { path: value.singbox.path, idleStopMs: value.singbox.idleStopMs, lanes: value.singbox.lanes },
     probeModels: resolveProbeModels(value.probeModels),
     maxConcurrentProbes: value.maxConcurrentProbes,
     maxRotateAttempts: value.maxRotateAttempts,

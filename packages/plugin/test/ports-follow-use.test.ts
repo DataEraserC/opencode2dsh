@@ -326,13 +326,15 @@ test('supervisor: ensureRunning with no converted nodes is a clean no-op', async
   assert.equal(supervisor.running, false)
 })
 
-test('settings: a custom idle stop survives resolve -> config mapping', () => {
-  const raw = IpPoolConfigSchema({ singbox: { path: '/usr/bin/sing-box', idleStopMs: 120_000 } }) as never
-  const value = resolveIpPoolSettings({ singbox: { path: '/usr/bin/sing-box', idleStopMs: 120_000 } })
+test('settings: a custom idle stop and lane budget survive resolve -> config mapping', () => {
+  const raw = IpPoolConfigSchema({ singbox: { path: '/usr/bin/sing-box', idleStopMs: 120_000, lanes: 8 } }) as never
+  const value = resolveIpPoolSettings({ singbox: { path: '/usr/bin/sing-box', idleStopMs: 120_000, lanes: 8 } })
   assert.equal(value.singbox.idleStopMs, 120_000)
-  assert.deepEqual(toIpPoolConfig(value).singbox, { path: '/usr/bin/sing-box', idleStopMs: 120_000 })
+  assert.equal(value.singbox.lanes, 8)
+  assert.deepEqual(toIpPoolConfig(value).singbox, { path: '/usr/bin/sing-box', idleStopMs: 120_000, lanes: 8 })
   // The schema default fills a missing key (boot path through the Loader).
-  const defaulted = IpPoolConfigSchema({}) as { singbox: { idleStopMs: number } }
+  const defaulted = IpPoolConfigSchema({}) as { singbox: { idleStopMs: number; lanes: number } }
   assert.equal(defaulted.singbox.idleStopMs, 600_000)
-  assert.ok(raw) // schema accepts the explicit knob
+  assert.equal(defaulted.singbox.lanes, 16)
+  assert.ok(raw) // schema accepts the explicit knobs
 })
