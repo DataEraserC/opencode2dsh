@@ -14,7 +14,7 @@
 
 import type { Dispatcher } from 'undici'
 
-import { PoolRoutingDispatcher, type RoutingDispatcherSurface, type UndiciSeam } from './dispatcher.ts'
+import { PoolRoutingDispatcher, type LocalExitHooks, type RoutingDispatcherSurface, type UndiciSeam } from './dispatcher.ts'
 import type { ExitPool } from './pool.ts'
 
 /** The setter accepts the full Dispatcher; our router exposes the subset
@@ -26,6 +26,8 @@ export interface InstallerDeps {
   pool: ExitPool
   undici: UndiciSeam
   proxyHosts?: string[]
+  /** Ports-follow-use seam forwarded to the routing dispatcher (docs 1.2.3). */
+  localExit?: LocalExitHooks
   logger?: { info(message: string): void; warn(message: string): void }
 }
 
@@ -104,6 +106,7 @@ export class RoutingInstaller {
       pool: this.#deps.pool,
       undici: this.#deps.undici,
       proxyHosts: this.#deps.proxyHosts,
+      localExit: this.#deps.localExit,
       logger: this.#deps.logger,
     })
     const previous = this.#deps.undici.setGlobalDispatcher(router as unknown as InstallableDispatcher)

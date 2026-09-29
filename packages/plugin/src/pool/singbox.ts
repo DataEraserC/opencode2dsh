@@ -230,6 +230,16 @@ export function nodeKeyOf(node: ParsedNode): string {
   return `${node.type}:${node.server}:${node.port}`
 }
 
+/** Same node set in the same order (ports derive from the index, so an
+ *  identical sequence means an identical config — reload can stay idle). */
+export function sameNodes(a: ParsedNode[], b: ParsedNode[]): boolean {
+  if (a.length !== b.length) return false
+  for (let i = 0; i < a.length; i += 1) {
+    if (nodeKeyOf(a[i]!) !== nodeKeyOf(b[i]!)) return false
+  }
+  return true
+}
+
 /** The full sing-box config for a node list (GoProxy generateConfig). */
 export function generateConfig(nodes: ParsedNode[], basePort = 30_000): GeneratedConfig {
   const portMap = new Map<string, number>()
@@ -293,6 +303,8 @@ export class SingBoxSupervisor {
   #dataDir: string
   #portMap = new Map<string, number>()
   #nodes: ParsedNode[] = []
+  /** Reload serialization chain (see reload): concurrent reloads collapse. */
+  #reloadChain: Promise<unknown> = Promise.resolve()
 
   constructor(options: SingBoxOptions) {
     this.#options = options
@@ -332,14 +344,35 @@ export class SingBoxSupervisor {
     return bin
   }
 
-  /** Full reload: regenerate the config for the node list and (re)start. */
-  async reload(nodes: ParsedNode[]): Promise<ConvertedExit[]> {
+  /** Full reload: regenerate the config for the node list and (re)start.
+   *  Serialized on purpose (ports follow use, docs 1.2.3): a subscription
+   *  refresh and an on-demand wake can race — the follower waits for the
+   *  leader and then lands on the sameNodes idempotency check, reusing the
+   *  child the leader just started instead of double-spawning. */
+  reload(nodes: ParsedNode[]): Promise<ConvertedExit[]> {
+    const run = this.#reloadChain.then(
+      () => this.#reloadLocked(nodes),
+      () => this.#reloadLocked(nodes),
+    )
+    this.#reloadChain = run.then(() => undefined, () => undefined)
+    return run
+  }
+
+  /** The serialized reload body (see reload). */
+  async #reloadLocked(nodes: ParsedNode[]): Promise<ConvertedExit[]> {
     // no tunnel nodes -> stop and clean (GoProxy Reload empty case)
     if (nodes.length === 0) {
       await this.stop()
       this.#nodes = []
       this.#portMap = new Map()
       return []
+    }
+    // Idempotent reload (ports follow use, docs 1.2.3): the same node set in
+    // the same order yields the same ports and the same config, so a
+    // subscription refresh with unchanged nodes must NOT recycle the child —
+    // a respawn would only drop in-flight streams every refresh interval.
+    if (this.#running && sameNodes(this.#nodes, nodes)) {
+      return this.#exitsFor(this.#nodes, this.#portMap)
     }
     const binary = await this.#resolveBinary()
     const { config, portMap } = generateConfig(nodes, this.#options.basePort ?? 30_000)
@@ -366,7 +399,6 @@ export class SingBoxSupervisor {
       stdio: ['ignore', 'ignore', 'pipe'],
     })
     const child = this.#child
-    this.#running = true
     this.#nodes = nodes
     this.#portMap = portMap
     child.stderr?.on('data', (chunk: Buffer) => {
@@ -385,7 +417,10 @@ export class SingBoxSupervisor {
     const ports = [...portMap.values()]
     let ready = false
     while (Date.now() < deadline && !ready) {
-      if (!this.#running) throw new Error('sing-box exited immediately after start (see logs)')
+      // Crash detection while #running is still false (ports follow use:
+      // the flag flips only after readiness, so a warm child never routes
+      // into not-yet-listening ports). "Exited" = no longer OUR live child.
+      if (this.#child !== child || child.exitCode !== null) throw new Error('sing-box exited immediately after start (see logs)')
       await new Promise((resolve) => setTimeout(resolve, 500))
       for (const port of ports) {
         // eslint-disable-next-line no-await-in-loop
@@ -397,6 +432,26 @@ export class SingBoxSupervisor {
     }
     if (!ready) this.#options.logger?.warn('opencode2dsh: sing-box ports not ready in time; some converted nodes may be unreachable')
 
+    // Up AND answering: only now is the local endpoint routable (the
+    // dispatcher's isRunning() gates on this — during warmup it serves
+    // direct instead of striking exits for dead ports).
+    this.#running = true
+    return this.#exitsFor(nodes, portMap)
+  }
+
+  /**
+   * Ports follow use (docs 1.2.3): make sure the child is up for the node
+   * list this supervisor already owns — a full spawn when it was stopped
+   * (idle-stop / disable), an idempotent pass-through while it runs.
+   * Returns the local exits the list maps to (empty when none converted).
+   */
+  async ensureRunning(): Promise<ConvertedExit[]> {
+    if (this.#nodes.length === 0) return []
+    return this.reload(this.#nodes)
+  }
+
+  /** Map a node list through its port map to the local SOCKS5 exits. */
+  #exitsFor(nodes: ParsedNode[], portMap: Map<string, number>): ConvertedExit[] {
     const exits: ConvertedExit[] = []
     for (const node of nodes) {
       const port = portMap.get(nodeKeyOf(node))

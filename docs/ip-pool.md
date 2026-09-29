@@ -142,6 +142,17 @@ design.md §9.2 曾把「多出口」定为灰色能力并默认关闭（当时�
 
 订阅 URL 与解析出的节点清单持久化在 settings（脱敏：URL 不回显明文）；转换映射（节点→本地端口）内存态，重启重建。
 
+#### 1.2.3 端口跟随使用（ports follow use）：本地端口只在真用时占用
+
+「每节点一端口」（§1.2.2）解决的是轮换可寻址性，但**端口占用本身是个资源纪律问题**：池子开着 ≠ 此刻有流量，没必要让 N 个本地端口常驻本机。生命周期四条规则（2026-09-29 起）：
+
+1. **关闭即释放**：设置页 `enabled` 关闭 → 立即 `supervisor.stop()`（SIGINT → 5s → SIGKILL），sing-box 子进程与全部本地端口当场回收（旧版只换回 dispatcher、子进程照跑 = 关不掉的端口泄漏，这是本节要修的原始 bug）。
+2. **闲置自动停**：启用状态下 `singbox.idleStopMs`（默认 600000 = 10 分钟，`0` = 一直运行）没有任何池子使用（路由请求 / 本地出口探测 / 转换）即停掉子进程释放端口；每 30s 巡检一次。
+3. **按需拉起**：停了不等于废了——三类触发随手拉回：路由层选中本地出口但子进程不在（该请求本回合先直连兜底，**绝不因端口没开而失败**，§3.3 never-fail-closed；随后的请求走拉起后的端口）、准入/探活要打本地出口（`ensureLocalEndpoints` 在第一个字节前拉起）、设置页重新开启（顺带把停用期间挂起的「待转换」节点立刻转换，不等下个 30min 刷新）。
+4. **刷新不重启**：订阅刷新（默认 30min）解析出的节点序列与运行中完全一致时（`sameNodes`，key=type:server:port 按序比对），`reload` 直接复用现有子进程与端口表——旧版每次刷新无条件全量 respawn，等于每 30 分钟无差别掐断所有在飞连接。
+
+状态可观测：桥 `/status` 与设置页状态行暴露 `singBoxRunning`（「sing-box 运行中」/「sing-box 未运行 · 本地端口已释放」），关闭后立刻能看到端口确实回收了。子进程只在 `singbox.path` 配置且订阅 URL 非空时存在，因此本机无 sing-box / 无订阅的用户与本节无关（明文节点、手填、pinned 走 undici 原生路径，零本地端口）。
+
 ### 1.3 从 GoProxy 吸取什么：抄「设计」，不接「实例」（对接已于 2026-09-05 摘牌）
 
 两问分开答：
@@ -464,6 +475,7 @@ POST {zen}/v1/chat/completions
 | blockedCountries | `['CN']` | 准入地理黑名单（国家代码） |
 | freeSourceEnabled | true | 免费源抓取总开关（关掉 = 只用 manual/subscription 来源） |
 | subscriptionRefreshMs | 30min | 订阅刷新间隔（拉 URL 重跑解析，断路器同免费源） |
+| singboxIdleStopMs | 600000（10min） | 本地端口空闲自动停止（§1.2.3 端口跟随使用；0 = 启用期间一直运行；关闭池子不受此值影响、立即释放） |
 | pinnedStrict | false | 绝对固定模式（§3.6）：true 时 pinned 失败透传、不换出口不直连 |
 
 全部进 settings namespace，设置页可调（maxConcurrentProbes 也开放：有些用户宁可慢也不并发）。
@@ -506,6 +518,7 @@ Config = Schema.object({
   }),
   singbox: Schema.object({                        // 加密节点转换核心（§1.2.2）
     path: Schema.string().default('sing-box'),    // sing-box 二进制路径（PATH 或绝对路径）
+    idleStopMs: Schema.number().min(0).default(600000),  // 端口跟随使用的空闲停机阈值（§1.2.3；0 = 一直运行）
   }),
   pinnedExitId: Schema.string().default(''),       // 固定主力出口（§3.6；出口列表行内设置或此处直填地址）
   pinnedStrict: Schema.boolean().default(false), // true = 绝对固定：失败也不换出口、不直连（§3.6 行为契约）

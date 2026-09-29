@@ -74,6 +74,9 @@ export interface IpPoolConfig {
     /** sing-box binary: PATH name or absolute path; unset parks encrypted
      *  nodes as pending-conversion. */
     path?: string
+    /** Ports follow use (docs 1.2.3): stop the local sing-box child after
+     *  this many ms with no pool use; 0 keeps it always-on while enabled. */
+    idleStopMs?: number
   }
   /** Admission smoke model (docs 4.1 probeModels[0]). */
   probeModels?: string[]

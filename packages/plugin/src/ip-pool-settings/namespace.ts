@@ -89,6 +89,8 @@ export const IpPoolConfigSchema = Schema.object({
   singbox: Schema.object({
     /** sing-box binary: PATH name or absolute path; empty parks encrypted nodes. */
     path: Schema.string().default('sing-box'),
+    /** Ports follow use (docs 1.2.3): idle auto-stop of the local child (ms; 0 = always-on). */
+    idleStopMs: Schema.number().min(0).step(1).default(600_000),
   }),
   /** Fixed primary exit address (docs §3.6). */
   pinnedExitId: Schema.string().default(''),
@@ -108,7 +110,7 @@ export interface IpPoolSettings {
   free: { enabled: boolean; targetSize: number; blockedCountries: string[] }
   manual: string[]
   subscription: { urls: string[]; refreshMs: number }
-  singbox: { path: string }
+  singbox: { path: string; idleStopMs: number }
   pinnedExitId: string
   pinnedStrict: boolean
   proxyHosts: string[]
@@ -172,7 +174,7 @@ export function resolveIpPoolSettings(value: AnyIpPoolSection | undefined): IpPo
       urls,
       refreshMs: raw.subscription?.refreshMs ?? 30 * 60_000,
     },
-    singbox: { path: raw.singbox?.path ?? 'sing-box' },
+    singbox: { path: raw.singbox?.path ?? 'sing-box', idleStopMs: raw.singbox?.idleStopMs ?? 600_000 },
     pinnedExitId: raw.pinnedExitId ?? '',
     pinnedStrict: raw.pinnedStrict ?? false,
     proxyHosts: raw.proxyHosts ?? [],
@@ -194,7 +196,7 @@ export function toIpPoolConfig(value: IpPoolSettings): {
   free: { enabled: boolean; targetSize: number; blockedCountries: string[] }
   subscriptions: string[]
   subscription: { refreshMs: number }
-  singbox: { path: string }
+  singbox: { path: string; idleStopMs: number }
   probeModels: string[]
   maxConcurrentProbes: number
   maxRotateAttempts: number
@@ -212,7 +214,7 @@ export function toIpPoolConfig(value: IpPoolSettings): {
     },
     subscriptions: value.subscription.urls,
     subscription: { refreshMs: value.subscription.refreshMs },
-    singbox: { path: value.singbox.path },
+    singbox: { path: value.singbox.path, idleStopMs: value.singbox.idleStopMs },
     probeModels: resolveProbeModels(value.probeModels),
     maxConcurrentProbes: value.maxConcurrentProbes,
     maxRotateAttempts: value.maxRotateAttempts,

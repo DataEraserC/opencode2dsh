@@ -18,7 +18,7 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 
 import { ExitPool, gradeOf, type ExitNode } from './pool/pool.ts'
-import type { UndiciSeam } from './pool/dispatcher.ts'
+import type { LocalExitHooks, UndiciSeam } from './pool/dispatcher.ts'
 import type { AdmissionDeps } from './pool/admission.ts'
 import { Prober } from './pool/prober.ts'
 import { RefillScheduler } from './pool/refill.ts'
@@ -30,6 +30,11 @@ import { createRotateDelegate, setRotateDelegate } from './pool/rotate.ts'
 function dataDir(): string {
   return join(homedir(), '.opencode2dsh')
 }
+
+/** Ports follow use (docs 1.2.3): default idle auto-stop of the local
+ *  sing-box child — ms with no pool use before the ports are released
+ *  (0 = keep it running while enabled). */
+const DEFAULT_IDLE_STOP_MS = 600_000
 
 /** Parse one manual proxy string into an exit id + protocol, or null. */
 export function parseManualProxy(
@@ -109,6 +114,9 @@ export interface IpPoolRuntime {
   subscriptions: SubscriptionFetcher | null
   /** Free-source refill loop (null when free.enabled false). */
   refill: RefillScheduler | null
+  /** Ports follow use (docs 1.2.3): local sing-box child up right now —
+   *  status bridge evidence that disable/idle actually released the ports. */
+  readonly singBoxRunning: boolean
   /** Hot-apply one committed settings value onto the live runtime (docs §5.1).
    *  Every knob lands without restart; enabled toggles the dispatcher. */
   reconfigure(next: Opencode2dshConfig): Promise<void>
@@ -149,10 +157,46 @@ export async function startIpPool(
   }
 
   const { RoutingInstaller } = await import('./pool/installer.ts')
+
+  // -- Ports follow use (docs 1.2.3) ---------------------------------------
+  // The local sing-box child owns every loopback port: it exists only while
+  // the pool is enabled AND actually in use. Disabling releases the ports
+  // immediately (reconfigure below); an enabled-but-idle pool stops the
+  // child after singbox.idleStopMs (default 10min, 0 = always-on); any real
+  // use — a routed request, a local-exit probe, a conversion — restarts it
+  // on demand.
+  let supervisor: SingBoxSupervisor | undefined
+  let lastLocalUse = Date.now()
+  const touchLocal = (): void => {
+    lastLocalUse = Date.now()
+  }
+  const ensureLocalRunning = async (): Promise<void> => {
+    const s = supervisor
+    if (s === undefined) return
+    touchLocal()
+    const wasRunning = s.running
+    try {
+      const exits = await s.ensureRunning()
+      if (!wasRunning && exits.length > 0) {
+        logger.info(`opencode2dsh: sing-box started on demand — ${exits.length} local port(s) opened`)
+      }
+    } catch (err) {
+      logger.warn(`opencode2dsh: on-demand sing-box start failed (${err instanceof Error ? err.message : String(err)})`)
+    }
+  }
+  const localExit: LocalExitHooks = {
+    isRunning: () => supervisor?.running === true,
+    // Fire-and-forget: the request itself serves direct (never fail closed,
+    // docs 3.3); the wake races on for the following requests.
+    onDown: () => { void ensureLocalRunning() },
+    onUse: () => touchLocal(),
+  }
+
   const installer = new RoutingInstaller({
     pool,
     undici,
     proxyHosts: ipPool.proxyHosts,
+    localExit,
     logger,
   })
 
@@ -162,6 +206,7 @@ export async function startIpPool(
     logger,
     blockedCountries: ipPool.free?.blockedCountries,
     smokeModel: (ipPool.probeModels ?? [])[0],
+    ensureLocalEndpoints: ensureLocalRunning,
   }
   const probeModels = ipPool.probeModels ?? []
   const prober = new Prober({ pool, maxConcurrentProbes: ipPool.maxConcurrentProbes ?? 3 })
@@ -173,7 +218,6 @@ export async function startIpPool(
   // Subscriptions (docs 1.2 source 3, IP-3/IP-4): pull + parse + trusted
   // smoke; encrypted nodes convert via sing-box when a binary is configured.
   let subscriptions: SubscriptionFetcher | null = null
-  let supervisor: SingBoxSupervisor | undefined
 
   const ensureSupervisor = (): SingBoxSupervisor | undefined => {
     const singboxPath = config.ipPool?.singbox?.path
@@ -194,7 +238,14 @@ export async function startIpPool(
     if (urls.length === 0) return null
     if (subscriptions === null) {
       subscriptions = new SubscriptionFetcher(
-        { ...admissionDeps, prober, supervisor: ensureSupervisor() },
+        {
+          ...admissionDeps,
+          prober,
+          supervisor: ensureSupervisor(),
+          // Ports follow use: while disabled nothing may open local ports —
+          // encrypted nodes park and convert on the enable flip.
+          maySpawn: () => config.ipPool?.enabled !== false,
+        },
         { logger },
       )
     }
@@ -255,6 +306,20 @@ export async function startIpPool(
     logger.warn('opencode2dsh: ipPool enabled but no exits configured; staying direct until settings add exits')
   }
   applyConfig()
+
+  // Idle sweep (ports follow use): every 30s release the child when nothing
+  // has used the pool for singbox.idleStopMs. Covers every state uniformly —
+  // an idle enabled pool, and a child spawned by a probe after disable (the
+  // disable flip itself stops it synchronously in reconfigure).
+  const idleTimer = setInterval(() => {
+    const s = supervisor
+    if (s === undefined || !s.running) return
+    const ms = config.ipPool?.singbox?.idleStopMs ?? DEFAULT_IDLE_STOP_MS
+    if (ms <= 0 || Date.now() - lastLocalUse < ms) return
+    logger.info(`opencode2dsh: sing-box idle for ${Math.round(ms / 60_000)}min — stopping it, local ports released (ports follow use)`)
+    void s.stop().catch(() => {})
+  }, 30_000)
+  idleTimer.unref?.()
 
   const probeAll = async (): Promise<number> => {
     const models = probeModels.length > 0 ? probeModels : ['big-pickle']
@@ -344,6 +409,7 @@ export async function startIpPool(
     prober,
     get subscriptions() { return subscriptions },
     get refill() { return refill },
+    get singBoxRunning(): boolean { return supervisor?.running === true },
     async reconfigure(next: Opencode2dshConfig) {
       const wasEnabled = config.ipPool?.enabled !== false
       // splice the new ipPool section into the config object the runtime closes over
@@ -369,6 +435,29 @@ export async function startIpPool(
       if (wasEnabled !== enable) {
         logger.info(`opencode2dsh: ip pool ${enable ? 'enabled' : 'disabled'} via settings (live)`)
       }
+      // Ports follow use (docs 1.2.3): the switch off releases every local
+      // port immediately (the child and all its loopback ports die with it);
+      // the switch on resets the idle clock and converts nodes parked while
+      // disabled instead of waiting out the subscription refresh.
+      if (!enable) {
+        const s = supervisor
+        if (s !== undefined && s.running) {
+          logger.info('opencode2dsh: ip pool disabled — stopping sing-box, local ports released')
+          await s.stop().catch(() => {})
+        }
+      } else {
+        touchLocal()
+        const convert = (): void => {
+          void subscriptions?.convertPending().catch((err: unknown) => {
+            logger.warn(`opencode2dsh: converting parked nodes on enable failed (${err instanceof Error ? err.message : String(err)})`)
+          })
+        }
+        convert()
+        // A refresh may be mid-flight (convertPending no-ops while it runs,
+        // and its spawn gate was evaluated before the flip) — retry once.
+        const retry = setTimeout(convert, 3_000)
+        retry.unref?.()
+      }
     },
     probeAll,
     probeExit,
@@ -379,10 +468,16 @@ export async function startIpPool(
       await subscriptions?.refreshNow()
     },
     async dispose() {
+      clearInterval(idleTimer)
       setRotateDelegate(null)
       subscriptions?.stop()
       refill?.stop()
       installer.dispose()
+      // subscriptions.stop() already reaches the supervisor when one
+      // exists; stop directly too so a child opened by an on-demand probe
+      // cannot outlive the runtime (stop is idempotent).
+      const s = supervisor
+      if (s !== undefined) await s.stop().catch(() => {})
     },
   }
 }

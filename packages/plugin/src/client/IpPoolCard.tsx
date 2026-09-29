@@ -70,7 +70,7 @@ export interface IpPoolSettingsValue {
   free: { enabled: boolean; targetSize: number; blockedCountries: string[] }
   manual: string[]
   subscription: { urls: string[]; refreshMs: number }
-  singbox: { path: string }
+  singbox: { path: string; idleStopMs: number }
   pinnedExitId: string
   pinnedStrict: boolean
   proxyHosts: string[]
@@ -79,6 +79,8 @@ export interface IpPoolSettingsValue {
 /** Bridge /status view (mirrors src/ip-pool-settings/bridge.ts). */
 export interface PoolStatusView {
   enabled: boolean
+  /** Ports follow use (docs 1.2.3): local sing-box child up right now. */
+  singBoxRunning?: boolean
   deferredReason: string
   state: 'healthy' | 'warning' | 'critical' | 'emergency'
   total: number
@@ -130,7 +132,7 @@ const DEFAULTS: IpPoolSettingsValue = {
   free: { enabled: true, targetSize: 20, blockedCountries: ['CN'] },
   manual: [],
   subscription: { urls: [], refreshMs: 30 * 60_000 },
-  singbox: { path: 'sing-box' },
+  singbox: { path: 'sing-box', idleStopMs: 600_000 },
   pinnedExitId: '',
   pinnedStrict: false,
   proxyHosts: [],
@@ -158,6 +160,7 @@ interface FormState {
   subscriptionUrls: string[]
   refreshMs: string
   singboxPath: string
+  singboxIdleStopMs: string
   pinnedExitId: string
   pinnedStrict: boolean
   probeModels: string[]
@@ -174,6 +177,7 @@ function emptyForm(): FormState {
     subscriptionUrls: [],
     refreshMs: String(DEFAULTS.subscription.refreshMs),
     singboxPath: DEFAULTS.singbox.path,
+    singboxIdleStopMs: String(DEFAULTS.singbox.idleStopMs),
     pinnedExitId: '',
     pinnedStrict: DEFAULTS.pinnedStrict,
     probeModels: [],
@@ -191,6 +195,7 @@ function formFromValue(value: IpPoolSettingsValue): FormState {
     subscriptionUrls: [...value.subscription.urls],
     refreshMs: String(value.subscription.refreshMs),
     singboxPath: value.singbox.path,
+    singboxIdleStopMs: String(value.singbox.idleStopMs),
     pinnedExitId: value.pinnedExitId,
     pinnedStrict: value.pinnedStrict,
     probeModels: [...value.probeModels],
@@ -235,7 +240,7 @@ function diffWrites(form: FormState, value: IpPoolSettingsValue, base: Partial<I
   push('free', { enabled: form.freeEnabled, targetSize: Number(form.targetSize), blockedCountries: splitCsv(form.blockedCountries) }, value.free, base.free)
   push('manual', form.manual, value.manual, base.manual)
   push('subscription', { urls: form.subscriptionUrls, refreshMs: Number(form.refreshMs) }, value.subscription, base.subscription)
-  push('singbox', { path: form.singboxPath }, value.singbox, base.singbox)
+  push('singbox', { path: form.singboxPath, idleStopMs: Number(form.singboxIdleStopMs) }, value.singbox, base.singbox)
   push('pinnedExitId', form.pinnedExitId, value.pinnedExitId, base.pinnedExitId)
   push('pinnedStrict', form.pinnedStrict, value.pinnedStrict, base.pinnedStrict)
   push('probeModels', form.probeModels, value.probeModels, base.probeModels)
@@ -631,6 +636,8 @@ function CardBody(props: { settings: ConfigPageForm | undefined; t: IpPoolCardPr
     if (!/^\d+$/.test(form.maxConcurrentProbes.trim()) || conc < 1 || conc > 8) return t('invalidRange')
     const refresh = Number(form.refreshMs)
     if (!/^\d+$/.test(form.refreshMs.trim()) || refresh < 60_000) return t('invalidRange')
+    const idle = Number(form.singboxIdleStopMs)
+    if (!/^\d+$/.test(form.singboxIdleStopMs.trim()) || idle < 0) return t('invalidRange')
     for (const entry of form.manual) {
       if (!/^https?:\/\/[^\s:]+:\d{1,5}$|^socks5:\/\/[^\s:]+:\d{1,5}$|^socks5h?:\/\/\[[^\]]+\]:\d{1,5}$/.test(entry)) return t('invalidProxy')
     }
@@ -852,6 +859,7 @@ function CardBody(props: { settings: ConfigPageForm | undefined; t: IpPoolCardPr
           <span className={styles.status}>
             {t('sectionSubscription')}: {status.subscription.pendingConversion} 待转换 · {status.subscription.convertedAdmitted} 已转换入池
             {status.subscription.lastError !== '' ? ` · ${status.subscription.lastError}` : ''}
+            {` · ${status.singBoxRunning === true ? t('singBoxRunning') : t('singBoxStopped')}`}
           </span>
         )}
         <TextField
@@ -860,6 +868,15 @@ function CardBody(props: { settings: ConfigPageForm | undefined; t: IpPoolCardPr
           value={form.singboxPath}
           testId="field-singboxPath"
           onChange={(value) => { setSaved(false); setForm({ ...form, singboxPath: value }) }}
+        />
+        <TextField
+          label={t('singboxIdleStop')}
+          hint={t('singboxIdleStopHint')}
+          value={form.singboxIdleStopMs}
+          type="number"
+          min={0}
+          testId="field-singboxIdleStopMs"
+          onChange={(value) => { setSaved(false); setForm({ ...form, singboxIdleStopMs: value }) }}
         />
       </div>
 

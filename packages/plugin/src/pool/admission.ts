@@ -21,6 +21,7 @@ import type { Dispatcher } from 'undici'
 import { ZEN_BASE_URL } from '../adapter/catalog.ts'
 import { FREE_LANE_GATE_TOOL_NAMES, freeLaneGateTool } from '../adapter/messages.ts'
 import { canonicalSessionID, disguiseHeaders, opencodeUserAgent, randomID, stableID } from '../adapter/ids.ts'
+import { isLoopback } from './dispatcher.ts'
 import { gradeOf, type ExitNode, type ExitPool } from './pool.ts'
 
 export interface AdmissionDeps {
@@ -37,6 +38,12 @@ export interface AdmissionDeps {
   smokeModel?: string
   timeoutMs?: number
   blockedCountries?: string[]
+  /**
+   * Ports follow use (docs 1.2.3): called before probing a LOOPBACK
+   * candidate, so the local sing-box child is up before any request touches
+   * its port. Only invoked when the candidate address is loopback.
+   */
+  ensureLocalEndpoints?: () => Promise<void>
   logger?: { warn(message: string): void }
 }
 
@@ -187,6 +194,12 @@ export async function admitCandidate(
     echoFacts?: EchoFacts
   } = {},
 ): Promise<AdmissionResult> {
+  // Ports follow use (docs 1.2.3): a loopback candidate is a local converted
+  // exit — make sure the child is running before the first byte goes at the
+  // port (no-op for external hosts and while the core is already up).
+  if (deps.ensureLocalEndpoints !== undefined && isLoopback(candidate.address)) {
+    await deps.ensureLocalEndpoints()
+  }
   const zenBase = deps.zenBaseUrl ?? ZEN_BASE_URL
   const timeout = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
   const smokeModel = deps.smokeModel ?? 'big-pickle'

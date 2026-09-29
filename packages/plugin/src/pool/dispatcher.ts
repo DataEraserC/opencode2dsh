@@ -67,6 +67,27 @@ export interface PoolRoutingOptions {
   headersMs?: number
   /** Log sink for routing decisions (diagnostics). */
   logger?: { warn(message: string): void }
+  /**
+   * Ports-follow-use seam (docs 1.2.3): the local sing-box child exists
+   * only while in use, so a picked local exit may be down right now. Only
+   * consulted for loopback exits.
+   */
+  localExit?: LocalExitHooks
+}
+
+/**
+ * Lifecycle seam over the local conversion core (implemented by the ip-pool
+ * runtime). Calls are IO-light and may be made from the hot dispatch path.
+ */
+export interface LocalExitHooks {
+  /** Sync: is the local core currently running? */
+  isRunning(): boolean
+  /** A request selected a local exit while the core is down: wake it
+   *  (fire-and-forget). The request itself serves direct — never fail
+   *  closed (docs 3.3). */
+  onDown(exitId: string): void
+  /** A request rode a local exit: reset the idle clock. */
+  onUse(exitId: string): void
 }
 
 const DEFAULT_PROXY_HOSTS = ['opencode.ai']
@@ -122,6 +143,7 @@ export class PoolRoutingDispatcher implements RoutingDispatcherSurface {
   #agents = new Map<string, Dispatcher>()
   #agentsOrder: string[] = []
   #closed = false
+  #localExit?: LocalExitHooks
 
   constructor(options: PoolRoutingOptions) {
     this.#pool = options.pool
@@ -133,6 +155,7 @@ export class PoolRoutingDispatcher implements RoutingDispatcherSurface {
     this.#sentinelMs = options.sentinelMs ?? 2_000
     this.#headersMs = options.headersMs ?? 10_000
     this.#logger = options.logger
+    this.#localExit = options.localExit
     this.#direct = new options.undici.Agent()
   }
 
@@ -208,6 +231,16 @@ export class PoolRoutingDispatcher implements RoutingDispatcherSurface {
     const agent = this.#agentFor(exitId)
     if (!agent) {
       return this.#direct.dispatch(options, handler)
+    }
+    // Ports follow use (docs 1.2.3): a loopback exit means the local child
+    // owns its port — if the idle-stop took it down, serve this request
+    // direct (never fail closed, 3.3) and wake the core for the next ones.
+    if (this.#localExit !== undefined && isLoopback(exitId)) {
+      if (!this.#localExit.isRunning()) {
+        this.#localExit.onDown(exitId)
+        return this.#direct.dispatch(options, handler)
+      }
+      this.#localExit.onUse(exitId)
     }
     return agent.dispatch(options, this.#observe(exitId, model, session, handler))
   }

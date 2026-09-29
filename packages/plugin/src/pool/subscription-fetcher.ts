@@ -28,7 +28,15 @@ export interface SubscriptionDeps extends AdmissionDeps {
     reload(nodes: ParsedNode[]): Promise<ConvertedExit[]>
     stop(): Promise<void>
     readonly running: boolean
+    /** Ports follow use (docs 1.2.3): start the child when it is stopped. */
+    ensureRunning?(): Promise<ConvertedExit[]>
   }
+  /**
+   * Spawn gate (ports follow use, docs 1.2.3): while the pool is disabled
+   * nothing may open local ports — encrypted nodes park instead of
+   * converting, and convertPending() stays closed too. Absent = allowed.
+   */
+  maySpawn?: () => boolean
 }
 
 export interface SubscriptionState {
@@ -153,40 +161,15 @@ export class SubscriptionFetcher {
         plaintextAdmitted: 0,
       }
       // Encrypted nodes -> sing-box conversion -> local SOCKS5 exits (IP-4).
-      // Without a supervisor configured they stay parked as pending.
-      if (pending.length > 0 && this.#deps.supervisor) {
-        try {
-          const exits = await this.#deps.supervisor.reload(pending)
-          const tasks: ProbeTask[] = exits
-            .filter((exit) => !this.#deps.pool.has(exit.address))
-            .map((exit): ProbeTask => ({
-              exitId: exit.address,
-              kind: 'subscription-smoke',
-              run: async () => {
-                const verdict = await admitTrusted(this.#deps, {
-                  address: exit.address,
-                  protocol: exit.protocol,
-                  source: 'subscription',
-                })
-                if (verdict.admitted && verdict.node) {
-                  if (this.#deps.pool.add(verdict.node)) {
-                    this.#deps.pool.markOk(verdict.node.id)
-                    this.#state.convertedAdmitted += 1
-                    const served = exit.node
-                    this.#state.pendingConversion = this.#state.pendingConversion.filter(
-                      (node) => node !== served,
-                    )
-                  }
-                }
-              },
-            }))
-          if (tasks.length > 0) await this.#deps.prober.enqueueAll(tasks)
-          this.#logger?.info(`opencode2dsh: sing-box converted ${exits.length} encrypted node(s); ${this.#state.convertedAdmitted} admitted`)
-        } catch (err) {
-          const message = err instanceof Error ? err.message : String(err)
-          this.#state.lastError = message
-          this.#logger?.warn(`opencode2dsh: sing-box conversion failed: ${message}`)
-        }
+      // Parked when no supervisor exists (no binary) or when the pool is
+      // disabled (ports follow use: nothing opens ports while off, docs
+      // 1.2.3); the enable flip converts the parked set via convertPending().
+      if (pending.length > 0 && this.#deps.supervisor && this.#deps.maySpawn?.() !== false) {
+        await this.#convertEncrypted(pending)
+      } else if (pending.length > 0) {
+        this.#logger?.info(
+          `opencode2dsh: ${pending.length} encrypted node(s) parked (${this.#deps.supervisor === undefined ? 'no sing-box supervisor' : 'pool disabled'}); they convert on enable`,
+        )
       }
       // Plaintext nodes go through the trusted admission smoke (never the
       // hot coarse screen: subscription nodes are paid resources, docs 4.1).
@@ -214,6 +197,73 @@ export class SubscriptionFetcher {
     } finally {
       this.#running = false
     }
+  }
+
+  /**
+   * Convert one pending set through the supervisor and smoke the new local
+   * exits into the pool (shared by refresh and convertPending; the CALLER
+   * owns the `#running` flag).
+   */
+  async #convertEncrypted(pending: ParsedNode[]): Promise<void> {
+    const supervisor = this.#deps.supervisor
+    if (supervisor === undefined) return
+    try {
+      const exits = await supervisor.reload(pending)
+      const tasks: ProbeTask[] = exits
+        .filter((exit) => !this.#deps.pool.has(exit.address))
+        .map((exit): ProbeTask => ({
+          exitId: exit.address,
+          kind: 'subscription-smoke',
+          run: async () => {
+            const verdict = await admitTrusted(this.#deps, {
+              address: exit.address,
+              protocol: exit.protocol,
+              source: 'subscription',
+            })
+            if (verdict.admitted && verdict.node) {
+              if (this.#deps.pool.add(verdict.node)) {
+                this.#deps.pool.markOk(verdict.node.id)
+                this.#state.convertedAdmitted += 1
+                const served = exit.node
+                this.#state.pendingConversion = this.#state.pendingConversion.filter(
+                  (node) => node !== served,
+                )
+              }
+            }
+          },
+        }))
+      if (tasks.length > 0) await this.#deps.prober.enqueueAll(tasks)
+      this.#logger?.info(`opencode2dsh: sing-box converted ${exits.length} encrypted node(s); ${this.#state.convertedAdmitted} admitted`)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      this.#state.lastError = message
+      this.#logger?.warn(`opencode2dsh: sing-box conversion failed: ${message}`)
+    }
+  }
+
+  /**
+   * Ports follow use (docs 1.2.3): called on the settings enable flip so
+   * nodes parked while disabled convert immediately instead of waiting for
+   * the next subscription refresh. No-op while a refresh runs, when there is
+   * nothing parked, or while the spawn gate is closed.
+   */
+  async convertPending(): Promise<SubscriptionState> {
+    const pending = this.#state.pendingConversion
+    if (
+      this.#running
+      || pending.length === 0
+      || this.#deps.supervisor === undefined
+      || this.#deps.maySpawn?.() === false
+    ) {
+      return this.state
+    }
+    this.#running = true
+    try {
+      await this.#convertEncrypted(pending)
+    } finally {
+      this.#running = false
+    }
+    return this.state
   }
 
   async #fetch(url: string): Promise<string> {

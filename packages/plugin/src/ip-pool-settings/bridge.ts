@@ -71,6 +71,9 @@ export interface SubscriptionView {
 
 export interface PoolStatusView {
   enabled: boolean
+  /** Ports follow use (docs 1.2.3): local sing-box child up right now —
+   *  false proves the disable/idle path released every local port. */
+  singBoxRunning: boolean
   /** Non-empty when the pool runs but the routing layer deferred to another
    *  dispatcher-level plugin (R1 coexistence policy). */
   deferredReason: string
@@ -120,6 +123,7 @@ export function buildStatusView(
     : []
   return {
     enabled: runtime !== null && runtime.installer.enabled,
+    singBoxRunning: runtime?.singBoxRunning === true,
     deferredReason: runtime !== null && !runtime.installer.enabled
       ? (runtime.installer as unknown as { deferredReason?: string }).deferredReason ?? ''
       : '',

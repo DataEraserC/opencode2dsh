@@ -29,6 +29,7 @@ test('schema fills every default from an empty section', () => {
   assert.deepEqual(value.manual, [])
   assert.deepEqual((value.subscription as Record<string, unknown>).urls, [])
   assert.equal((value.singbox as Record<string, unknown>).path, 'sing-box')
+  assert.equal((value.singbox as Record<string, unknown>).idleStopMs, 600_000)
   assert.equal(value.pinnedExitId, '')
   assert.equal(value.pinnedStrict, false)
 })
@@ -58,7 +59,7 @@ test('toIpPoolConfig maps the settings value onto the plugin config shape', () =
   assert.equal(mapped.pinnedStrict, true)
   assert.deepEqual(mapped.subscriptions, ['https://sub.example.com/token'])
   assert.deepEqual(mapped.probeModels, ['big-pickle'])
-  assert.deepEqual(mapped.singbox, { path: 'sing-box' })
+  assert.deepEqual(mapped.singbox, { path: 'sing-box', idleStopMs: 600_000 })
   // The runtime reads these two off the config shape (ip-pool.ts:
   // Prober construction + SubscriptionFetcher interval), so dropping them here
   // would reset them to the default on every live commit.

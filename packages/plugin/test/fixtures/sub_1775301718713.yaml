@@ -1,0 +1,239 @@
+# Clash subscription fixture for tests (shape mirrors the GoProxy sample
+# subscriptions/sub_1775301718713.yaml: 38 anytls nodes + proxy-groups).
+proxies:
+  - name: us01-shanhai
+    type: anytls
+    server: us01.shanhai.click
+    port: 18888
+    password: 848f43e4-6e11-4efa-9f96-84c0e16a03e5
+    sni: us01.shanhai.click
+    skip-cert-verify: true
+  - name: us02-airport
+    type: anytls
+    server: us02.example-airport.test
+    port: 18890
+    password: 00000000-0000-4000-8000-000000000002
+    sni: us02.example-airport.test
+  - name: us03-airport
+    type: anytls
+    server: us03.example-airport.test
+    port: 18891
+    password: 00000000-0000-4000-8000-000000000003
+    sni: us03.example-airport.test
+  - name: us04-airport
+    type: anytls
+    server: us04.example-airport.test
+    port: 18892
+    password: 00000000-0000-4000-8000-000000000004
+    sni: us04.example-airport.test
+  - name: us05-airport
+    type: anytls
+    server: us05.example-airport.test
+    port: 18893
+    password: 00000000-0000-4000-8000-000000000005
+    sni: us05.example-airport.test
+  - name: us06-airport
+    type: anytls
+    server: us06.example-airport.test
+    port: 18894
+    password: 00000000-0000-4000-8000-000000000006
+    sni: us06.example-airport.test
+  - name: us07-airport
+    type: anytls
+    server: us07.example-airport.test
+    port: 18895
+    password: 00000000-0000-4000-8000-000000000007
+    sni: us07.example-airport.test
+  - name: us08-airport
+    type: anytls
+    server: us08.example-airport.test
+    port: 18896
+    password: 00000000-0000-4000-8000-000000000008
+    sni: us08.example-airport.test
+  - name: us09-airport
+    type: anytls
+    server: us09.example-airport.test
+    port: 18897
+    password: 00000000-0000-4000-8000-000000000009
+    sni: us09.example-airport.test
+  - name: us10-airport
+    type: anytls
+    server: us10.example-airport.test
+    port: 18898
+    password: 00000000-0000-4000-8000-000000000010
+    sni: us10.example-airport.test
+  - name: us11-airport
+    type: anytls
+    server: us11.example-airport.test
+    port: 18899
+    password: 00000000-0000-4000-8000-000000000011
+    sni: us11.example-airport.test
+  - name: us12-airport
+    type: anytls
+    server: us12.example-airport.test
+    port: 18900
+    password: 00000000-0000-4000-8000-000000000012
+    sni: us12.example-airport.test
+  - name: us13-airport
+    type: anytls
+    server: us13.example-airport.test
+    port: 18901
+    password: 00000000-0000-4000-8000-000000000013
+    sni: us13.example-airport.test
+  - name: us14-airport
+    type: anytls
+    server: us14.example-airport.test
+    port: 18902
+    password: 00000000-0000-4000-8000-000000000014
+    sni: us14.example-airport.test
+  - name: us15-airport
+    type: anytls
+    server: us15.example-airport.test
+    port: 18903
+    password: 00000000-0000-4000-8000-000000000015
+    sni: us15.example-airport.test
+  - name: us16-airport
+    type: anytls
+    server: us16.example-airport.test
+    port: 18904
+    password: 00000000-0000-4000-8000-000000000016
+    sni: us16.example-airport.test
+  - name: us17-airport
+    type: anytls
+    server: us17.example-airport.test
+    port: 18905
+    password: 00000000-0000-4000-8000-000000000017
+    sni: us17.example-airport.test
+  - name: us18-airport
+    type: anytls
+    server: us18.example-airport.test
+    port: 18906
+    password: 00000000-0000-4000-8000-000000000018
+    sni: us18.example-airport.test
+  - name: us19-airport
+    type: anytls
+    server: us19.example-airport.test
+    port: 18907
+    password: 00000000-0000-4000-8000-000000000019
+    sni: us19.example-airport.test
+  - name: us20-airport
+    type: anytls
+    server: us20.example-airport.test
+    port: 18908
+    password: 00000000-0000-4000-8000-000000000020
+    sni: us20.example-airport.test
+  - name: us21-airport
+    type: anytls
+    server: us21.example-airport.test
+    port: 18909
+    password: 00000000-0000-4000-8000-000000000021
+    sni: us21.example-airport.test
+  - name: us22-airport
+    type: anytls
+    server: us22.example-airport.test
+    port: 18910
+    password: 00000000-0000-4000-8000-000000000022
+    sni: us22.example-airport.test
+  - name: us23-airport
+    type: anytls
+    server: us23.example-airport.test
+    port: 18911
+    password: 00000000-0000-4000-8000-000000000023
+    sni: us23.example-airport.test
+  - name: us24-airport
+    type: anytls
+    server: us24.example-airport.test
+    port: 18912
+    password: 00000000-0000-4000-8000-000000000024
+    sni: us24.example-airport.test
+  - name: us25-airport
+    type: anytls
+    server: us25.example-airport.test
+    port: 18913
+    password: 00000000-0000-4000-8000-000000000025
+    sni: us25.example-airport.test
+  - name: us26-airport
+    type: anytls
+    server: us26.example-airport.test
+    port: 18914
+    password: 00000000-0000-4000-8000-000000000026
+    sni: us26.example-airport.test
+  - name: us27-airport
+    type: anytls
+    server: us27.example-airport.test
+    port: 18915
+    password: 00000000-0000-4000-8000-000000000027
+    sni: us27.example-airport.test
+  - name: us28-airport
+    type: anytls
+    server: us28.example-airport.test
+    port: 18916
+    password: 00000000-0000-4000-8000-000000000028
+    sni: us28.example-airport.test
+  - name: us29-airport
+    type: anytls
+    server: us29.example-airport.test
+    port: 18917
+    password: 00000000-0000-4000-8000-000000000029
+    sni: us29.example-airport.test
+  - name: us30-airport
+    type: anytls
+    server: us30.example-airport.test
+    port: 18918
+    password: 00000000-0000-4000-8000-000000000030
+    sni: us30.example-airport.test
+  - name: us31-airport
+    type: anytls
+    server: us31.example-airport.test
+    port: 18919
+    password: 00000000-0000-4000-8000-000000000031
+    sni: us31.example-airport.test
+  - name: us32-airport
+    type: anytls
+    server: us32.example-airport.test
+    port: 18920
+    password: 00000000-0000-4000-8000-000000000032
+    sni: us32.example-airport.test
+  - name: us33-airport
+    type: anytls
+    server: us33.example-airport.test
+    port: 18921
+    password: 00000000-0000-4000-8000-000000000033
+    sni: us33.example-airport.test
+  - name: us34-airport
+    type: anytls
+    server: us34.example-airport.test
+    port: 18922
+    password: 00000000-0000-4000-8000-000000000034
+    sni: us34.example-airport.test
+  - name: us35-airport
+    type: anytls
+    server: us35.example-airport.test
+    port: 18923
+    password: 00000000-0000-4000-8000-000000000035
+    sni: us35.example-airport.test
+  - name: us36-airport
+    type: anytls
+    server: us36.example-airport.test
+    port: 18924
+    password: 00000000-0000-4000-8000-000000000036
+    sni: us36.example-airport.test
+  - name: us37-airport
+    type: anytls
+    server: us37.example-airport.test
+    port: 18925
+    password: 00000000-0000-4000-8000-000000000037
+    sni: us37.example-airport.test
+  - name: us38-airport
+    type: anytls
+    server: us38.example-airport.test
+    port: 18926
+    password: 00000000-0000-4000-8000-000000000038
+    sni: us38.example-airport.test
+proxy-groups:
+  - name: auto
+    type: url-test
+    proxies:
+      - us01-shanhai
+rules:
+  - MATCH,auto
