@@ -62,9 +62,23 @@ export function applyIpPoolSettings(
   }
 
   /** Assemble on first enable; reuse across later commits (live reconfigure). */
+  // In-flight memo: controller.runtime stays null until assemble() resolves,
+  // so a boot apply racing a loader/volatile-update (or a save committing
+  // through both paths) would otherwise fire TWO startIpPool() calls — the
+  // loser runtime leaks with live timers and its own installer, whose
+  // PoolRoutingDispatcher the winner's install() reads as a foreign owner
+  // (permanent R1 deferral, status and routing each telling a different story).
+  let assembling: Promise<void> | null = null
   const ensureRuntime = async (): Promise<void> => {
     if (controller.runtime !== null) return
-    controller.runtime = await assemble(controller.asConfig(controller.settings()), logger)
+    if (assembling === null) {
+      assembling = (async () => {
+        controller.runtime = await assemble(controller.asConfig(controller.settings()), logger)
+      })().finally(() => {
+        assembling = null
+      })
+    }
+    await assembling
   }
 
   // Cold-start ordering: the Loader has already resolved schema defaults, the

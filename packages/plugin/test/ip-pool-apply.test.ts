@@ -205,3 +205,33 @@ test('the settings page is claimed lazily and never gates the fiber', async () =
   assert.equal(injections.some((list) => list.includes('webServer')), true, 'webServer is still requested for the bridge')
   assert.deepEqual(configureCalls, [{ auto: false }], 'the plugin serves its own IP 池 card')
 })
+
+test('a boot apply racing volatile-update commits assembles exactly once — regression: leaked second runtime', async () => {
+  // controller.runtime stays null until assemble() resolves; without an
+  // in-flight memo every applyCommitted(enabled) during that window fired
+  // its OWN startIpPool. The loser runtime leaks with live timers and its
+  // own installer — whose PoolRoutingDispatcher the winner's install() then
+  // reads as a foreign owner (permanent "R1: owned by PoolRoutingDispatcher"
+  // while status and routing tell different stories; live-observed 2026-09-29).
+  resetCalls()
+  const host = makeVolatileHost({ enabled: true })
+  let assembleCalls = 0
+  let release: () => void = () => {}
+  const gate = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const slowAssemble: AssembleIpPool = async (config, logger) => {
+    assembleCalls += 1
+    await gate
+    return assemble(config, logger)
+  }
+  const controller = applyIpPoolSettings(host.ctx, ordinary(), () => host.ref.get(), host.ctx.logger, { assemble: slowAssemble })
+  // two commits land while the first assemble is still in flight
+  host.commit({ enabled: true })
+  host.commit({ enabled: true })
+  release()
+  await tick()
+  assert.equal(assembleCalls, 1, 'single assemble despite racing applies')
+  assert.equal(starts.length, 1)
+  assert.ok(controller.runtime !== null, 'runtime wired after the shared assemble')
+})

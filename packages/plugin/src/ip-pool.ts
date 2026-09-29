@@ -171,7 +171,11 @@ export async function startIpPool(
     lastLocalUse = Date.now()
   }
   const ensureLocalRunning = async (): Promise<void> => {
-    const s = supervisor
+    // Create the supervisor on demand: a cold runtime (enabled before any
+    // conversion ever spawned a child) must be able to wake too — the old
+    // `supervisor === undefined → return` made every wake a silent no-op
+    // there, leaving loopback exits dialing a child that never starts.
+    const s = ensureSupervisor() ?? undefined
     if (s === undefined) return
     touchLocal()
     const wasRunning = s.running
@@ -472,6 +476,12 @@ export async function startIpPool(
         }
       } else {
         touchLocal()
+        // Ports follow use: bring local endpoints up front on the flip on —
+        // plaintext exits ARE loopback ports of the sing-box child, and the
+        // first requests after the save would otherwise race the on-demand
+        // spawn (live-observed: rotate gave up with Connection error ×4
+        // before the child was listening).
+        if (pool.snapshot().total > 0) void ensureLocalRunning()
         const convert = (): void => {
           void subscriptions?.convertPending().catch((err: unknown) => {
             logger.warn(`opencode2dsh: converting parked nodes on enable failed (${err instanceof Error ? err.message : String(err)})`)

@@ -182,6 +182,87 @@ test('installer: install/disable swaps the global dispatcher and restores the pr
   assert.equal(installed[1], originalDispatcher)
 })
 
+test('installer: void setGlobalDispatcher (real host) still restores the slot — regression: R1 self-lock', () => {
+  const pool = new ExitPool()
+  pool.add(node({ id: 'p:1' }))
+  pool.markOk('p:1')
+
+  const { seam } = fakeSeam()
+  const originalDispatcher = { tag: 'original' }
+  let current: unknown = originalDispatcher
+  const voidSeam = {
+    ...seam,
+    // npm undici 8 returns undefined from setGlobalDispatcher (verified on
+    // this host) — the bug that kept #previous null and orphaned our router.
+    setGlobalDispatcher: (dispatcher: unknown) => {
+      current = dispatcher
+      return undefined
+    },
+    getGlobalDispatcher: () => current as never,
+  }
+  const installer = new RoutingInstaller({
+    pool,
+    undici: voidSeam as never,
+    logger: { info: () => {}, warn: () => {} },
+  })
+
+  installer.install()
+  assert.ok(installer.enabled)
+  assert.ok(current instanceof PoolRoutingDispatcher, 'router occupies the slot')
+
+  installer.disable()
+  assert.ok(!installer.enabled)
+  assert.equal(current, originalDispatcher, 'pre-install dispatcher restored despite a void setter')
+
+  installer.install()
+  assert.ok(installer.enabled, 're-install after disable is not self-locked')
+  assert.equal(installer.deferredReason, null)
+  installer.disable()
+})
+
+test('installer: a stale own router in the slot is adopted, not read as foreign — regression: R1 naming itself', () => {
+  const pool = new ExitPool()
+  const { seam } = fakeSeam()
+  // Same class NAME as the real router — #detectForeignDispatcher matches on
+  // constructor name only, so this stands in for an orphaned ours.
+  class PoolRoutingDispatcher {
+    dispatch(): boolean {
+      return true
+    }
+  }
+  const stale = new PoolRoutingDispatcher()
+  let current: unknown = stale
+  const orphanSeam = {
+    ...seam,
+    setGlobalDispatcher: (dispatcher: unknown) => {
+      current = dispatcher
+      return undefined
+    },
+    getGlobalDispatcher: () => current as never,
+  }
+  const warned: string[] = []
+  const installer = new RoutingInstaller({
+    pool,
+    undici: orphanSeam as never,
+    logger: { info: () => {}, warn: (m) => warned.push(m) },
+  })
+
+  installer.install()
+  assert.ok(installer.enabled, 'own stale layer adopted instead of deferring R1')
+  assert.equal(installer.deferredReason, null)
+  assert.notEqual(current, stale, 'the new router replaced the stale one')
+  assert.ok(warned.every((m) => !m.includes('R1')), 'no deferral warning')
+
+  installer.disable()
+  // no previous was captured (the stale layer hid the real one) — the
+  // fallback must still evict our router rather than leave it orphaned
+  assert.notEqual(
+    (current as { constructor?: { name?: string } }).constructor?.name,
+    'PoolRoutingDispatcher',
+    'slot cleared on disable even without a captured previous',
+  )
+})
+
 test('end-to-end: builtin fetch routes through a real local proxy via the installer', async () => {
   // The load-bearing integration test (docs/ip-pool.md 2): npm undici's
   // setGlobalDispatcher + our PoolRoutingDispatcher drive the BUILTIN fetch.

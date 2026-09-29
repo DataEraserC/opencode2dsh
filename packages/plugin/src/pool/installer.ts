@@ -89,6 +89,12 @@ export class RoutingInstaller {
     // installed anything), and anything unnamed are not a foreign plugin.
     if (name === '' || name === 'Object' || name === 'Agent' || name === 'Dispatcher') return null
     if (current instanceof (this.#deps.undici.Agent as unknown as { new (): unknown })) return null
+    // Our own stale layer, not a foreign plugin: a disable that could not
+    // restore the slot (the real undici setter returns void — see install())
+    // leaves our router in place. Reading it back as "foreign" would
+    // dead-lock install() into this very deferral forever (live-observed:
+    // deferredReason naming PoolRoutingDispatcher itself). Adopt and replace.
+    if (name === 'PoolRoutingDispatcher') return null
     return `deferred: global dispatcher is owned by "${name}" — install dsh-llm-proxy or the IP pool in one profile only, not both (R1)`
   }
 
@@ -109,9 +115,27 @@ export class RoutingInstaller {
       localExit: this.#deps.localExit,
       logger: this.#deps.logger,
     })
+    // Capture the pre-install dispatcher BEFORE swapping: npm undici's
+    // setGlobalDispatcher returns undefined on the real host (verified), so
+    // relying on the setter's return kept #previous null — disable() then
+    // skipped the restore, our router lingered as an orphan, and the next
+    // install() read its own layer as a foreign owner (permanent R1 deferral,
+    // live-observed "owned by PoolRoutingDispatcher").
+    let prior: Dispatcher | null = null
+    try {
+      const captured: unknown = this.#deps.undici.getGlobalDispatcher()
+      const capturedName = (captured as { constructor?: { name?: string } } | null)?.constructor?.name ?? ''
+      if (captured instanceof Object && capturedName !== 'PoolRoutingDispatcher') {
+        prior = captured as Dispatcher
+      }
+    } catch {
+      // seam may throw — the setter's return below (or the disable-time
+      // fallback) covers it
+    }
     const previous = this.#deps.undici.setGlobalDispatcher(router as unknown as InstallableDispatcher)
-    // undici's setter returns the replaced dispatcher (void on some hosts)
-    if (previous instanceof Object) this.#previous = previous as Dispatcher
+    // some hosts/seams DO return the replaced dispatcher — prefer it when present
+    if (previous instanceof Object) prior = previous as Dispatcher
+    this.#previous = prior
     const old = this.#current
     this.#current = router
     this.#enabled = true
@@ -149,6 +173,17 @@ export class RoutingInstaller {
         // uninstall still succeeded for our own layer
       }
       this.#previous = null
+    } else {
+      // Nothing captured at install time: reset the slot to a fresh default
+      // Agent (setGlobalDispatcher(undefined) throws UND_ERR_INVALID_ARG on
+      // the real host) so our router cannot linger after disable and be read
+      // as a foreign owner by the next install.
+      try {
+        this.#deps.undici.setGlobalDispatcher(new this.#deps.undici.Agent())
+      } catch {
+        // no usable Agent on this seam — the R1 adoption path in
+        // #detectForeignDispatcher still recovers the next install
+      }
     }
     const dying = this.#current
     this.#current = null
