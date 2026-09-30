@@ -78,13 +78,14 @@ export { Config } from './config.ts'
  * `ctx.inject` instead.
  */
 export const inject = ['llm'] as const
-export function apply(ctx: PluginContext, config: ResolvedPluginConfig | Opencode2dshConfig = {}): { ready: Promise<ReadyInfo> } {
+export function apply(ctx: PluginContext, config: ResolvedPluginConfig | Opencode2dshConfig = {}): void {
   // A host that predates the `Config` export hands over the raw patch object
   // (no volatile reference); readVolatile copes with both spellings.
   const resolved = config as ResolvedPluginConfig
   const mode = resolveConfig(config as Opencode2dshConfig).mode
-  if (mode === 'sidecar') return applySidecar(ctx, config as Opencode2dshConfig)
-  return applyAdapter(ctx, resolved, () => readVolatile<IpPoolSettings>(resolved.ipPool))
+  // Cordis accepts disposal effects; readiness objects are invalid effects.
+  if (mode === 'sidecar') applySidecar(ctx, config as Opencode2dshConfig)
+  else applyAdapter(ctx, resolved, () => readVolatile<IpPoolSettings>(resolved.ipPool))
 }
 
 /**

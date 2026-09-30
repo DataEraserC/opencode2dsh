@@ -132,9 +132,11 @@ https://opencode.ai/zen/v1        ← Authorization: Bearer public
 | 现象 | 可能原因与处理 |
 | --- | --- |
 | 启动页报 `Failed to load plugins … list slot "plugins.item" requires options.id`，或 IP 池条目没有配置页 | DSH 早于 0.1.7 的插件页契约。升级 DSH 到 0.1.7（推荐最新）；页面挂载门控是 `configForms.whileServed`，0.1.6 及更早上整页不出现，模型路由不受影响。 |
+| 安装插件后 DSH 0.1.7/0.2 无法启动，报 `pending … settingsScope` | 更新插件到 0.3.5；DSH 0.2 的 IP 池设置在插件页的 opencode2dsh 条目里。 |
 | 只有 3 个模型 | 启动时网络未就绪，重试会在约 1 分钟内补齐；看 `adapter-status.json` 里的 `lastError`。 |
 | `lastError: "fetch failed"` 持续出现 | 出站 HTTPS 到 `opencode.ai` 被拦截；检查代理/VPN 规则。 |
 | 对话中报限流错误 | 匿名通道按 IP 限额；切换网络节点或稍后再试。 |
+| Muse 报 `REGION_BLOCKED` / "This model is not available in your country" | Zen 不向当前网络地区提供该模型。插件 0.3.5 保留上游解释；旧版会把这个 403 误报为 API 密钥无效。匿名通道不需要个人密钥，可使用当前地区可用的模型。 |
 | 连接 `127.0.0.1:*` 报错 | 残留的 sidecar 路由遮蔽了 adapter；插件 ≥ 0.2.1 启动时会自动清理。 |
 | 安装时报 `ERR_PNPM_IGNORED_BUILDS` | `pi-ai` 的传递依赖（`@google/genai`、`protobufjs`）带构建脚本，运行时并不需要。在插件市场里按提示选择允许/拒绝，或在 profile 的 `pnpm-workspace.yaml` 的 `allowBuilds:` 下把这两项设为 `false`。 |
 
@@ -150,7 +152,7 @@ https://opencode.ai/zen/v1        ← Authorization: Bearer public
 git clone https://github.com/FishBottle7/opencode2dsh.git
 cd opencode2dsh/packages/plugin
 pnpm install
-pnpm typecheck && pnpm test   # 44 个单元测试
+pnpm typecheck && pnpm test
 pnpm build                    # 打包到 lib/
 ```
 

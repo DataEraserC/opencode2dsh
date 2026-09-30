@@ -11,11 +11,16 @@
  * either absent or throws if touched, so a regression toward the old protocol
  * fails here instead of silently working in tests and breaking on a real host.
  */
-import { test } from 'node:test'
+import { test, mock } from 'node:test'
 import assert from 'node:assert/strict'
 
 import { apply, inject, Config, type PluginContext } from '../src/index.ts'
 import { resolveIpPoolSettings, type AnyIpPoolSection, type IpPoolSettings, type VolatileRef } from '../src/ip-pool-settings/namespace.ts'
+import { ModelCatalog } from '../src/adapter/catalog.ts'
+
+// These tests exercise registration and settings contracts, not transport or
+// the user's on-disk catalog. Real fiber startup is covered by the smoke script.
+mock.method(ModelCatalog.prototype, 'start', async () => {})
 
 /**
  * What cosmokit gives the plugin: a STABLE object whose `get()` returns the

@@ -110,6 +110,7 @@ test('client manifest is declared in package.json', () => {
   assert.ok(!pkg.dsh.client.inject.some((e: string) => e.includes('settingsScope')), 'the service DSH removed is not requested')
 
   const entry = readFileSync(new URL('../src/client/index.ts', import.meta.url), 'utf8')
-  assert.match(entry, /export const inject = \['slots', 'locale', 'configForms'\]/, 'the client entry injects services')
+  assert.match(entry, /export const inject = \['slots', 'locale'\]/, 'only stable services gate the main client fiber')
+  assert.ok(bundle().includes('plugins.row.config'), 'the DSH 0.2 row configuration is registered')
   assert.deepEqual(pkg.exports?.['./client'], './lib/client.js')
 })

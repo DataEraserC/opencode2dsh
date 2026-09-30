@@ -226,6 +226,8 @@ export class AgentProcess extends EventEmitter {
   }
 
   private async terminate(child: ChildProcess): Promise<void> {
+    // Observe exit before taskkill: it may finish before the command settles.
+    const exited = new Promise<void>((resolve) => child.once('exit', () => resolve()))
     if (process.platform === 'win32') {
       // Windows has no deliverable SIGTERM for other processes; taskkill /T
       // terminates the tree (graceful attempt without /F first).
@@ -233,9 +235,10 @@ export class AgentProcess extends EventEmitter {
     } else {
       child.kill('SIGTERM')
     }
-    const exited = new Promise<void>((resolve) => child.once('exit', () => resolve()))
-    const timeout = new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), GRACEFUL_STOP_TIMEOUT_MS))
+    let timer: NodeJS.Timeout | undefined
+    const timeout = new Promise<'timeout'>((resolve) => { timer = setTimeout(() => resolve('timeout'), GRACEFUL_STOP_TIMEOUT_MS) })
     const result = await Promise.race([exited.then(() => 'exit' as const), timeout])
+    clearTimeout(timer)
     if (result === 'timeout') {
       if (process.platform === 'win32') {
         await this.taskkill(child, true).catch(() => child.kill())
@@ -259,9 +262,9 @@ export class AgentProcess extends EventEmitter {
     return new Promise((resolve, reject) => {
       if (!child.pid) return resolve()
       const args = force ? ['/T', '/F', '/PID', String(child.pid)] : ['/T', '/PID', String(child.pid)]
-      const killer = spawn('taskkill', args, { stdio: 'ignore' })
+      const killer = spawn('taskkill', args, { stdio: 'ignore', windowsHide: true, timeout: GRACEFUL_STOP_TIMEOUT_MS })
       killer.once('error', reject)
-      killer.once('exit', () => resolve())
+      killer.once('exit', (code) => code === 0 ? resolve() : reject(new Error(`taskkill failed: exit ${code}`)))
     })
   }
 

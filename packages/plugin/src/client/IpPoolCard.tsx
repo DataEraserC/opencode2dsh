@@ -71,6 +71,8 @@ export interface IpPoolSettingsValue {
   free: { enabled: boolean; targetSize: number; blockedCountries: string[] }
   manual: string[]
   subscription: { urls: string[]; refreshMs: number }
+  /** Previous composition spelling, migrated on a subscription edit. */
+  subscriptions?: string[]
   singbox: { path: string; idleStopMs: number; lanes: number }
   pinnedExitId: string
   pinnedStrict: boolean
@@ -626,10 +628,10 @@ function CardBody(props: { settings: ConfigPageForm | undefined; t: IpPoolCardPr
   const validation = validate()
   const dirty = writes.length > 0 || validation !== null
   const available = snapshot?.status === 'ready' && settings !== undefined
-  const writable = available && settings?.state.status === 'ready'
+  const writable = available && settings?.state.status === 'ready' && snapshot?.writable === true
 
   const handleSave = async (): Promise<void> => {
-    if (validation !== null || settings === undefined || snapshot === undefined) {
+    if (!writable || validation !== null || settings === undefined || snapshot === undefined) {
       setSaved(false)
       setError(validation ?? t('saveError'))
       return
@@ -687,10 +689,11 @@ function CardBody(props: { settings: ConfigPageForm | undefined; t: IpPoolCardPr
 
   /** Pin an exit from the table: writes pinnedExitId and saves immediately. */
   const pinExit = async (exitId: string): Promise<void> => {
-    if (settings === undefined || snapshot === undefined) return
+    if (!writable || settings === undefined || snapshot === undefined) return
     setActionBusy(true)
     try {
-      await settings.mutate([{ op: 'set', path: [IP_POOL_FIELD, 'pinnedExitId'], value: exitId }], snapshot.revision)
+      const accepted = await settings.mutate([{ op: 'set', path: [IP_POOL_FIELD, 'pinnedExitId'], value: exitId }], snapshot.revision)
+      if (!accepted) throw new Error(t('saveError'))
       setForm((current) => ({ ...current, pinnedExitId: exitId }))
     } catch (err) {
       setError(err instanceof Error ? err.message : t('saveError'))

@@ -158,6 +158,60 @@ test('ModelCatalog.reasoningCapability reads the parsed metadata', async () => {
   }
 })
 
+test('decodeModelsDev extracts the declared context/output limits', () => {
+  const payload = {
+    opencode: {
+      models: {
+        // live shape: limit.context is the window, limit.output the max completion
+        'windowed-free': { cost: { input: 0, output: 0 }, limit: { context: 131072, output: 16384 } },
+        // output-only and context-only declarations both stand alone
+        'output-only-free': { cost: { input: 0, output: 0 }, limit: { output: 8192 } },
+        'context-only-free': { cost: { input: 0, output: 0 }, limit: { context: 1048576 } },
+        // no limit block: keys stay absent so pre-limit caches remain valid
+        'limitless-free': { cost: { input: 0, output: 0 } },
+        // malformed values are dropped, not guessed
+        'bad-limit-free': { cost: { input: 0, output: 0 }, limit: { context: 'huge', output: null } },
+      },
+    },
+  }
+  const prices = decodeModelsDev(payload)
+  assert.deepEqual(prices.get('windowed-free')?.contextWindow, 131072)
+  assert.deepEqual(prices.get('windowed-free')?.maxOutput, 16384)
+  assert.equal(prices.get('output-only-free')?.contextWindow, undefined)
+  assert.equal(prices.get('output-only-free')?.maxOutput, 8192)
+  assert.equal(prices.get('context-only-free')?.maxOutput, undefined)
+  assert.equal('contextWindow' in (prices.get('limitless-free') ?? {}), false)
+  assert.equal('maxOutput' in (prices.get('limitless-free') ?? {}), false)
+  assert.equal(prices.get('bad-limit-free')?.contextWindow, undefined)
+  assert.equal(prices.get('bad-limit-free')?.maxOutput, undefined)
+})
+
+test('ModelCatalog.limits speaks only when the metadata declares them', async () => {
+  const catalog = new ModelCatalog({
+    fetchImpl: fakeFetch({
+      'https://opencode.ai/zen/v1/models': zenBody,
+      'https://models.dev/api.json': {
+        opencode: {
+          models: {
+            'qwen-free': { cost: { input: 0, output: 0 }, limit: { context: 262144, output: 32768 } },
+            'paid-model': { cost: { input: 1, output: 2 } },
+          },
+        },
+      },
+    }),
+  })
+  try {
+    await catalog.refreshOnce()
+    assert.deepEqual(catalog.limits('qwen-free'), { contextWindow: 262144, maxOutput: 32768 })
+    // capability is independent of the free decision: paid models still speak
+    assert.deepEqual(catalog.limits('paid-model'), undefined)
+    // metadata cannot speak for the model
+    assert.equal(catalog.limits('ghost-free'), undefined)
+  } finally {
+    catalog.stop()
+  }
+})
+
 function fakeFetch(routes: Record<string, unknown>, capture: { url?: string; init?: RequestInit } = {}) {
   return (async (url: string | URL, init?: RequestInit) => {
     capture.url = String(url)

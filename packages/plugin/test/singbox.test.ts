@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { ANYTLS_SUBSCRIPTION } from './fixtures/anytls.ts'
 
 import { buildOutbound, generateConfig, nodeKeyOf, SingBoxSupervisor } from '../src/pool/singbox.ts'
 import { parseSubscription, type ParsedNode } from '../src/pool/subscription.ts'
@@ -163,7 +163,7 @@ test('generateConfig: all-unsupported node list still yields a runnable config (
 // -- conversion pipeline (fetcher + supervisor seam) ---------------------------
 
 test('subscription refresh with supervisor: encrypted nodes convert and smoke into the pool', async () => {
-  const fixture = readFileSync(new URL('./fixtures/sub_1775301718713.yaml', import.meta.url), 'utf8')
+  const fixture = ANYTLS_SUBSCRIPTION
   const report = parseSubscription(fixture)
   assert.equal(report.nodes.length, 38)
 
@@ -225,7 +225,7 @@ test('subscription refresh with supervisor: encrypted nodes convert and smoke in
 })
 
 test('subscription refresh without supervisor: encrypted nodes park as pending', async () => {
-  const fixture = readFileSync(new URL('./fixtures/sub_1775301718713.yaml', import.meta.url), 'utf8')
+  const fixture = ANYTLS_SUBSCRIPTION
   const pool = new ExitPool()
   const prober = new Prober({ pool })
   const fetcher = new SubscriptionFetcher(

@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { ANYTLS_SUBSCRIPTION } from './fixtures/anytls.ts'
 
 import {
   looksLikeProxyLinks,
@@ -160,19 +160,15 @@ test('plain address list falls through', () => {
   assert.equal(report.nodes[1]?.type, 'socks5')
 })
 
-test('real-world airport fixture: 38 anytls nodes parse clean', () => {
-  // The Clash subscription sample committed in the GoProxy repository
-  // (subscriptions/sub_1775301718713.yaml): a real airport config with
-  // proxy-groups and anytls nodes — the parser must take only the proxies
-  // section and skip the group entries.
-  const fixture = readFileSync(new URL('./fixtures/sub_1775301718713.yaml', import.meta.url), 'utf8')
+test('Clash subscription fixture: 38 anytls nodes parse clean and groups are ignored', () => {
+  const fixture = ANYTLS_SUBSCRIPTION
   const report = parseSubscription(fixture)
   assert.equal(report.detected, 'clash-yaml')
   assert.equal(report.nodes.length, 38)
   assert.ok(report.nodes.every((node: ParsedNode) => node.type === 'anytls'))
   const first = report.nodes[0]
-  assert.equal(first?.server, 'us01.shanhai.click')
+  assert.equal(first?.server, 'node01.example.test')
   assert.equal(first?.port, 18888)
-  assert.equal(first?.raw.password, '848f43e4-6e11-4efa-9f96-84c0e16a03e5')
-  assert.equal(first?.raw.sni, 'us01.shanhai.click')
+  assert.equal(first?.raw.password, 'test-password')
+  assert.equal(first?.raw.sni, 'node01.example.test')
 })

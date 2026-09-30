@@ -46,7 +46,7 @@ llm-pi-ai:
 - `createProvider({id, name, baseUrl, headers, auth, models, api})`（models.d.ts:158）：构造 provider，`baseUrl` 直指 `https://opencode.ai/zen/v1`，`api` 传 `@earendil-works/pi-ai/api/openai-completions` 模块（导出 `stream`/`streamSimple`，即 DSH 一切 OpenAI 兼容 provider 使用的同一实现）
 - `StreamOptions.headers`（types.d.ts:78-85）：**调用方值覆盖默认头** → user-agent 伪装可覆盖（R-B 解除）；`StreamOptions` 是每次调用的参数 → **动态 session/request 头每请求构造传入**（R-A 解除）
 - `StreamOptions.apiKey`：传字面量 `'public'`（非秘密，无需 credentials 服务）
-- `inputModalities: ['text']` 声明后 dsh-llm 运行时自动剥离图片（`projectImagesForTextModel`，dsh-llm index.js adapterStream）→ 消息转换无图片负担
+- `inputModalities: ['text', 'image']` 声明后 dsh-llm 把图片块原样派发（声明不含 `image` 时才自动剥离：`projectImagesForTextModel`，dsh-llm index.js adapterStream）→ `toPiContext` 从 harness 附件存储读字节转 pi-ai image 块（2026-09-23 起）
 - pi-ai `Model` 接口（types.d.ts:637）：`{id, name, api, provider, baseUrl, reasoning, input, cost, contextWindow, maxTokens, headers?, compat?}`，目录构造目标
 - pi-ai `Context`：`{systemPrompt?, messages, tools?}`；`Message = UserMessage | AssistantMessage | ToolResultMessage`；内容块 `text | thinking | toolCall | image`
 - chunk 输出词汇表（dsh-llm-pi-ai toStreamChunks，index.js:1342-1420 逐条核实）：`block-start{text|reasoning|tool-call}` / `text-delta` / `reasoning-delta` / `tool-call-delta` / `block-end` / `usage` / `finish{reason, replayState?}`，流必须以 usage+finish 终止
