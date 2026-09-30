@@ -5,7 +5,7 @@ import * as openaiResponses from '@earendil-works/pi-ai/api/openai-responses'
 import { ModelCatalog, ZEN_BASE_URL } from './catalog.ts'
 import { toStreamChunks, type HarnessChunk, type PiEvent } from './events.ts'
 import { deriveRequestIDs, disguiseHeaders } from './ids.ts'
-import { ensureFreeLaneShape, toPiContext, type HarnessGenerateOptions } from './messages.ts'
+import { ensureFreeLaneShape, toPiContext, type HarnessGenerateOptions, type PiContext } from './messages.ts'
 import { routingContext, type RoutingContext } from '../pool/dispatcher.ts'
 import { classifyStreamFailure, isRegionBlocked, shouldRotate } from '../pool/rotate.ts'
 
@@ -172,6 +172,19 @@ export function isResponsesModel(id: string): boolean {
   return String(id ?? '').toLowerCase().startsWith('muse-spark')
 }
 
+/**
+ * Vision gate: ids whose image input is verified end-to-end on the Zen lane
+ * (the mimo-v2.6 family — an image round-trip through DSH 0.1.7-rc.2 was
+ * live-verified on 2026-09-28). Models outside the pattern stay text-only so
+ * DSH's attachment gates and pi-ai's image downgrade both refuse image parts
+ * instead of forwarding them to a model that cannot see them. DSH's per-model
+ * input-type checkbox overrides the declared modalities whenever another lane
+ * is verified later.
+ */
+export function isVisionModel(id: string): boolean {
+  return /^mimo-v2\.6/i.test(String(id ?? ''))
+}
+
 function toPiModel(id: string, reasoning: boolean, limits?: { contextWindow?: number; maxOutput?: number }): Model<Api> {
   const isResponses = isResponsesModel(id)
   return {
@@ -183,9 +196,13 @@ function toPiModel(id: string, reasoning: boolean, limits?: { contextWindow?: nu
     // The honest capability flag: gates pi-ai's reasoning_effort branch and
     // keeps developer-role replay suppressed (the Zen lane's compat detects
     // supportsDeveloperRole=false for opencode.ai, so the system slot is
-    // unchanged either way).
+    // unchanged either way). `image` (vision models only, see isVisionModel)
+    // keeps pi-ai's downgradeUnsupportedImages from dropping the image parts
+    // toPiContext loads from the attachment store (the Zen gateway accepts
+    // image_url data URLs, live-probed 2026-09-23; full round-trip through
+    // DSH 0.1.7-rc.2 with mimo-v2.6-flash-free 2026-09-28).
     reasoning,
-    input: ['text'],
+    input: isVisionModel(id) ? ['text', 'image'] : ['text'],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: contextWindowFor(limits),
     maxTokens: defaultMaxTokensFor(limits),
@@ -267,7 +284,7 @@ export class ZenAdapter {
     for (const id of this.#catalog.list()) {
       if (seen.has(id)) continue
       seen.add(id)
-      models.push({ provider, id, name: id, inputModalities: ['text'] })
+      models.push({ provider, id, name: id, inputModalities: isVisionModel(id) ? ['text', 'image'] : ['text'] })
     }
     return models
   }
@@ -285,7 +302,7 @@ export class ZenAdapter {
       provider,
       id: model,
       name: model,
-      inputModalities: ['text'],
+      inputModalities: isVisionModel(model) ? ['text', 'image'] : ['text'],
       context: { contextWindow: contextWindowFor(this.#catalog.limits?.(model)) },
       defaultMaxTokens: defaultMaxTokensFor(this.#catalog.limits?.(model)),
     }
@@ -317,7 +334,7 @@ export class ZenAdapter {
    * failure is not exit-shaped) = the original stream surface untouched.
    */
   async *stream(options: HarnessGenerateOptions): AsyncGenerator<HarnessChunk> {
-    const context = toPiContext(options)
+    const context = await toPiContext(options)
     const ids = deriveRequestIDs(options.messages)
     const model = toPiModel(options.model, this.#catalog.reasoningCapability(options.model)?.reasoning === true, this.#catalog.limits?.(options.model))
     // IP-pool routing context (docs/ip-pool.md 3.3): pi-ai builds the request
@@ -499,7 +516,7 @@ export class ZenAdapter {
 
   #eventsFor(
     options: HarnessGenerateOptions,
-    context: ReturnType<typeof toPiContext>,
+    context: PiContext,
     ids: ReturnType<typeof deriveRequestIDs>,
     model: ReturnType<typeof toPiModel>,
   ): unknown {
