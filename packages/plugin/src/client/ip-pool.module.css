@@ -1,75 +1,8 @@
-/* IP 池 plugin card — header naming the plugin, disclosing the items in place
-   (token usage copied from dsh-llm-proxy, verified against the DSH palette). */
+/* IP 池 settings page body — the form the Plugins page renders inside its own
+   detail section (token usage copied from dsh-llm-proxy, verified against the
+   DSH palette). The page owns the card chrome, title and save control. */
 
-.card {
-  list-style: none;
-  border: 1px solid var(--dsw-alias-border-l2, #d0d7de);
-  border-radius: 12px;
-  background: var(--dsw-alias-bg-layer-3, #ffffff);
-  transition: border-color .16s, background .16s;
-}
-
-.card:hover {
-  border-color: var(--dsw-alias-label-dimmed, #8b949e);
-}
-
-.header {
-  width: 100%;
-  appearance: none;
-  border: 0;
-  background: none;
-  font: inherit;
-  color: inherit;
-  text-align: left;
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 14px 16px;
-  border-radius: 12px;
-}
-
-.header:focus-visible {
-  outline: 2px solid var(--dsw-alias-state-business-primary, #4f8cff);
-  outline-offset: -2px;
-}
-
-.headText {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.name {
-  font-size: 15px;
-  font-weight: 600;
-  line-height: 1.4;
-  color: var(--dsw-alias-label-primary, #1f2329);
-}
-
-.description {
-  font-size: 13px;
-  line-height: 1.5;
-  color: var(--dsw-alias-label-tertiary, #6b7280);
-}
-
-.chevron {
-  flex: none;
-  color: var(--dsw-alias-label-tertiary, #6b7280);
-  transition: transform .16s;
-}
-
-.chevronOpen {
-  transform: rotate(180deg);
-}
-
-/* The disclosed controls. */
 .body {
-  border-top: 1px solid var(--dsw-alias-border-l2, #d0d7de);
-  margin: 0 16px;
-  padding: 14px 0 8px;
   display: flex;
   flex-direction: column;
   gap: 14px;
@@ -199,33 +132,6 @@
 .rowAdd:hover {
   border-color: var(--dsw-alias-state-business-primary, #4f8cff);
   color: var(--dsw-alias-state-business-primary, #4f8cff);
-}
-
-.footer {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin-top: 2px;
-}
-
-.primaryButton {
-  padding: 6px 14px;
-  border: none;
-  border-radius: 6px;
-  background: var(--dsw-alias-button-primary-fill, #4f8cff);
-  color: var(--dsw-alias-label-primary-foreground, #ffffff);
-  font-size: 13px;
-  font-weight: 500;
-  cursor: pointer;
-}
-
-.primaryButton:hover {
-  background: var(--dsw-alias-button-primary-hover, #3b76e0);
-}
-
-.primaryButton:disabled {
-  opacity: 0.6;
-  cursor: default;
 }
 
 .ghostButton {

@@ -1,3 +1,4 @@
+import { normalizeResponsesPayload } from '../src/adapter/zen-adapter.ts'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { ModelCatalog } from '../src/adapter/catalog.ts'
@@ -25,14 +26,50 @@ test('providerRetryPolicy defers to the host default', () => {
   assert.equal(adapter.providerRetryPolicy('opencode2dsh'), undefined)
 })
 
-test('resolveModel declares text-only input and finite limits', () => {
+test('resolveModel declares image input only for verified vision models', () => {
   const adapter = new ZenAdapter(new ModelCatalog())
-  const resolved = adapter.resolveModel('opencode2dsh', 'big-pickle')
-  assert.deepEqual(resolved.inputModalities, ['text'])
-  assert.equal(resolved.context.contextWindow > 0, true)
-  assert.equal(resolved.defaultMaxTokens > 0, true)
-  assert.equal(resolved.provider, 'opencode2dsh')
-  assert.equal(resolved.id, 'big-pickle')
+  const textOnly = adapter.resolveModel('opencode2dsh', 'big-pickle')
+  assert.deepEqual(textOnly.inputModalities, ['text'])
+  assert.equal(textOnly.context.contextWindow > 0, true)
+  assert.equal(textOnly.defaultMaxTokens > 0, true)
+  assert.equal(textOnly.provider, 'opencode2dsh')
+  assert.equal(textOnly.id, 'big-pickle')
+  // The mimo-v2.6 family is the live-verified vision lane (2026-09-28).
+  const vision = adapter.resolveModel('opencode2dsh', 'mimo-v2.6-flash-free')
+  assert.deepEqual(vision.inputModalities, ['text', 'image'])
+})
+
+test('resolveModel prefers models.dev limits and keeps the defaults without them', () => {
+  const catalog = (limits?: { contextWindow?: number; maxOutput?: number }) => ({
+    list: () => ['big-pickle', 'ghost'],
+    decision: () => ({ allowed: true, source: 'test', known: true }),
+    reasoningCapability: () => undefined,
+    limits: (model: string) => (model === 'big-pickle' ? limits : undefined),
+  })
+  // declared window wins over the flat host default
+  const windowed = new ZenAdapter(catalog({ contextWindow: 131072, maxOutput: 16384 }))
+  assert.equal(windowed.resolveModel('opencode2dsh', 'big-pickle').context.contextWindow, 131072)
+  assert.equal(windowed.resolveModel('opencode2dsh', 'big-pickle').defaultMaxTokens, 16384)
+
+  // A larger declared budget must remain available for reasoning and answers.
+  const capped = new ZenAdapter(catalog({ maxOutput: 4096 }))
+  assert.equal(capped.resolveModel('opencode2dsh', 'big-pickle').defaultMaxTokens, 4096)
+  const roomy = new ZenAdapter(catalog({ contextWindow: 1048576, maxOutput: 384000 }))
+  assert.equal(roomy.resolveModel('opencode2dsh', 'big-pickle').context.contextWindow, 1048576)
+  assert.equal(roomy.resolveModel('opencode2dsh', 'big-pickle').defaultMaxTokens, 384000)
+
+  // metadata cannot speak: flat defaults, exactly as before the fix
+  const plain = new ZenAdapter(catalog())
+  assert.equal(plain.resolveModel('opencode2dsh', 'ghost').context.contextWindow, 262144)
+  assert.equal(plain.resolveModel('opencode2dsh', 'ghost').defaultMaxTokens, 32768)
+
+  // a catalog without a limits() member at all (structural CatalogLike)
+  const legacy = new ZenAdapter({
+    list: () => ['big-pickle'],
+    decision: () => ({ allowed: true, source: 'test', known: true }),
+    reasoningCapability: () => undefined,
+  })
+  assert.equal(legacy.resolveModel('opencode2dsh', 'big-pickle').context.contextWindow, 262144)
 })
 
 test('prepareCall returns the resolved model and a stream dispatcher', async () => {
@@ -44,12 +81,14 @@ test('prepareCall returns the resolved model and a stream dispatcher', async () 
 
 test('listModels mirrors the catalog without duplicates', () => {
   const adapter = new ZenAdapter({
-    list: () => ['big-pickle', 'big-pickle', 'mimo-v2.5-free'],
+    list: () => ['big-pickle', 'big-pickle', 'mimo-v2.5-free', 'mimo-v2.6-flash-free'],
     decision: () => ({ allowed: true, source: 'test', known: true }),
     reasoningCapability: () => ({ reasoning: true, effortValues: [] }),
   })
   const models = adapter.listModels('opencode2dsh')
-  assert.deepEqual(models.map((m) => m.id), ['big-pickle', 'mimo-v2.5-free'])
+  assert.deepEqual(models.map((m) => m.id), ['big-pickle', 'mimo-v2.5-free', 'mimo-v2.6-flash-free'])
+  // Only the verified vision family advertises image input.
+  assert.deepEqual(models.map((m) => m.inputModalities), [['text'], ['text'], ['text', 'image']])
 })
 
 test('reasoningEfforts: declared ladder wins, none folds into off, default ladder otherwise', () => {
@@ -172,6 +211,31 @@ test('stream keeps the free-lane gate rewrite alongside the effort injection', a
   assert.equal(offOptions.onPayload?.(null), undefined)
 })
 
+test('stream builds the pi-ai wire model with the catalog limits', async () => {
+  let seen: { contextWindow?: number; maxTokens?: number } | undefined
+  const provider = {
+    streamSimple(model: { contextWindow?: number; maxTokens?: number }, _context: unknown, _options: unknown): AsyncIterable<{ type: string }> {
+      seen = model
+      return (async function* () {
+        yield { type: 'start' }
+        yield { type: 'done', message: { stopReason: 'stop', content: [], usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2 } } }
+      })()
+    },
+  }
+  const adapter = new ZenAdapter(
+    {
+      list: () => ['big-pickle'],
+      decision: () => ({ allowed: true, source: 'test', known: true }),
+      reasoningCapability: () => undefined,
+      limits: () => ({ contextWindow: 65536, maxOutput: 8192 }),
+    },
+    { providerOverride: provider },
+  )
+  for await (const chunk of adapter.stream({ provider: 'opencode2dsh', model: 'big-pickle', messages: [] })) void chunk
+  assert.equal(seen?.contextWindow, 65536)
+  assert.equal(seen?.maxTokens, 8192)
+})
+
 test('isResponsesModel routes muse-spark to responses, everything else to chat', () => {
   for (const id of ['muse-spark-1.3-contributor-free', 'muse-spark-1.2-contributor-free', 'muse-spark-1.2', 'MUSE-SPARK-1.3']) {
     assert.equal(isResponsesModel(id), true, id)
@@ -196,7 +260,11 @@ test('responses models use the wider body-idle window, injectable for tests', as
   }
   const measure = async (model: string) => {
     const adapter = new ZenAdapter(
-      { list: () => [], decision: () => ({ allowed: true, source: 'test', known: true }) },
+      {
+        list: () => [],
+        decision: () => ({ allowed: true, source: 'test', known: true }),
+        reasoningCapability: () => undefined,
+      },
       { providerOverride: { streamSimple: () => hangAfterStart() }, firstEventMs: 50, bodyIdleMs: 50, responsesBodyIdleMs: 400 },
     )
     const began = Date.now()
@@ -215,4 +283,53 @@ test('responses models use the wider body-idle window, injectable for tests', as
   const responses = await measure('muse-spark-1.2-contributor-free')
   assert.equal(responses.reason?.kind, 'error')
   assert.ok(responses.elapsed > 350, `responses should honor the injected 400ms window, took ${responses.elapsed}ms`)
+})
+test('Responses payloads use reasoning and remove unsupported none/off fields', () => {
+  assert.deepEqual(
+    normalizeResponsesPayload({ input: [], reasoning: { effort: 'none' }, reasoning_effort: 'none' }),
+    { input: [] },
+  )
+  assert.deepEqual(
+    normalizeResponsesPayload({ input: [], reasoning_effort: 'low' }),
+    { input: [], reasoning: { effort: 'low' } },
+  )
+  assert.deepEqual(
+    normalizeResponsesPayload({ input: [], reasoning: { summary: 'auto' } }, 'high'),
+    { input: [], reasoning: { summary: 'auto', effort: 'high' } },
+  )
+})
+
+test('Responses streams pass a valid reasoning option and sanitize the payload', async () => {
+  let capturedOptions: { reasoning?: string; onPayload?: (payload: unknown) => unknown } | undefined
+  const provider = {
+    streamSimple: (_model: unknown, _context: unknown, options: { reasoning?: string; onPayload?: (payload: unknown) => unknown }) => {
+      capturedOptions = options
+      return (async function* () {
+        yield { type: 'start' }
+        yield { type: 'text_delta', delta: 'ok' }
+        yield { type: 'done', message: { stopReason: 'stop', content: [], usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2 } } }
+      })()
+    },
+  }
+  const adapter = new ZenAdapter(
+    {
+      list: () => ['muse-spark-1.2-contributor-free'],
+      decision: () => ({ allowed: true, source: 'test', known: true }),
+      reasoningCapability: () => ({ reasoning: true, effortValues: ['minimal', 'low', 'high'] }),
+    },
+    { providerOverride: provider },
+  )
+  const stream = adapter.stream({
+    provider: 'opencode2dsh',
+    model: 'muse-spark-1.2-contributor-free',
+    messages: [],
+    reasoningEffort: 'high',
+  })
+  for await (const _chunk of stream) void _chunk
+  assert.equal(capturedOptions?.reasoning, 'high')
+  const payload = capturedOptions?.onPayload?.({ input: [], reasoning: { effort: 'none' }, reasoning_effort: 'none' }) as Record<string, unknown>
+  assert.deepEqual(payload.reasoning, { effort: 'high' })
+  assert.equal(payload.reasoning_effort, undefined)
+  assert.equal(payload.tool_choice, 'auto')
+  assert.deepEqual((payload.tools as Array<{ name: string }>).map((tool) => tool.name), ['bash', 'read'])
 })

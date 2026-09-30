@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.3.5 (2026-09-30)
+
+### Fixed
+
+- Restore startup on DSH 0.1.7 and 0.2: the client no longer gates on the removed `settingsScope`; the host requires only `llm`. The server entry returns a valid Cordis effect.
+- IP-pool configuration uses the served entry form on 0.1.7 and the installed plugin row on 0.2. Saves respect read-only forms, clear overrides when restoring inherited values, preserve older subscription URLs, and apply live. Late pool startup is disposed correctly on unload.
+- Muse Spark 1.3 uses Responses for requests and history. Reasoning choices use the nested payload; default requests omit unsupported `none`/`off`. Responses free-lane gate tools use the flat function format and supported `auto` choice.
+- Add the missing `imageRequestPricing` method used by `/compact`.
+- Read each model's context and output limits from models.dev, using the declared output budget instead of an extra 32768 ceiling. Invalid or missing limits retain the fallback.
+- Windows agent shutdown handles `taskkill` failures and observes exit before starting shutdown. Tests use portable subscription fixtures.
+
+### Added
+
+- Image input for the verified MiMo v2.6 family. User/tool-result attachments are loaded from the harness store; offloaded images stay offloaded, missing files produce placeholders, and text-only models keep their existing capabilities.
+
 ## 0.3.3 (2026-09-18)
 
 ### Added

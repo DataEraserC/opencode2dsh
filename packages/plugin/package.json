@@ -1,6 +1,6 @@
 {
   "name": "@opencode2dsh/dsh-plugin",
-  "version": "0.3.3",
+  "version": "0.3.5",
   "description": "Free OpenCode Zen models for DeepSeek Harness (DSH): native dsh-llm adapter plugin, no API key.",
   "type": "module",
   "main": "lib/index.js",
@@ -34,16 +34,19 @@
     },
     "client": {
       "inject": [
-        "slots",
-        "locale",
-        "settingsScope"
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-plugin-manager"
       ],
-      "platform": "web"
+      "platform": "web",
+      "external": [
+        "@deepseek-ai/dsh-client-ui-primitives"
+      ]
     }
   },
   "scripts": {
     "build": "tsdown src/index.ts --format esm --dts --out-dir lib --no-clean",
-    "prepack": "node -e \"require('fs').rmSync('lib',{recursive:true,force:true})\" && pnpm build && pnpm build:client && node ../../scripts/prepare-package.mjs",
+    "prepack": "node -e \"require('fs').rmSync('lib',{recursive:true,force:true})\" && npm run build && npm run build:client && node ../../scripts/prepare-package.mjs",
     "typecheck": "tsc --noEmit",
     "test": "node --test \"test/*.test.ts\"",
     "build:client": "tsdown -c tsdown.client.config.ts"
@@ -67,7 +70,7 @@
   ],
   "license": "MIT",
   "dependencies": {
-    "@deepseek-ai/schemastery": "^3.18.1",
+    "@deepseek-ai/schemastery": "^3.18.4",
     "@earendil-works/pi-ai": "^0.82.1",
     "undici": "^8.10.1",
     "yaml": "^2.9.0"
@@ -79,12 +82,16 @@
     ]
   },
   "devDependencies": {
-    "@deepseek-ai/cordis": "^4.0.1",
-    "@deepseek-ai/dsh-client-locale": "0.1.1-rc.2",
+    "@deepseek-ai/cordis": "^4.0.4",
+    "@deepseek-ai/cordis-plugin-include": "~1.0.9",
+    "@deepseek-ai/cordis-plugin-loader": "~1.0.5",
+    "@deepseek-ai/dsh-client-locale": "0.1.7-rc.2",
     "@deepseek-ai/dsh-client-runtime": "0.1.1-rc.2",
-    "@deepseek-ai/dsh-client-ui-primitives": "0.1.1-rc.2",
-    "@deepseek-ai/dsh-client-ui-settings-plugins": "0.1.1-rc.2",
-    "@deepseek-ai/dsh-client-ui-slots": "0.1.1-rc.2",
+    "@deepseek-ai/dsh-client-ui-plugin-manager": "0.1.7-rc.2",
+    "@deepseek-ai/dsh-client-ui-primitives": "0.1.7-rc.2",
+    "@deepseek-ai/dsh-client-ui-renderer": "0.1.7-rc.2",
+    "@deepseek-ai/dsh-client-ui-settings": "0.1.7-rc.2",
+    "@deepseek-ai/dsh-client-ui-slots": "0.1.7-rc.2",
     "@deepseek-ai/dsh-credentials": "^0.1.1-rc.2",
     "@deepseek-ai/dsh-settings": "^0.1.1-rc.2",
     "@types/node": "^24.0.0",

@@ -32,7 +32,7 @@ nothing to host.
 - **Zero credential, zero setup** — the anonymous lane needs no key; install, restart, chat
 - **Native adapter, no sidecar** — one npm package, no child process, no binary, no local port (the legacy Go sidecar is not part of the published package; see `legacy/`)
 - **CLI-identical disguise** — requests carry the OpenCode CLI user agent and its session/request/project header set, derived per conversation
-- **Selectable thinking levels** — reasoning-capable free models expose an effort picker in DSH's model selector (declared ladders where the model metadata provides them, Off/Minimal/Low/Medium/High otherwise); Off sends `reasoning_effort: "none"` upstream to actually stop thinking, and no selection keeps the provider default
+- **Selectable thinking levels** — reasoning-capable free models expose an effort picker in DSH's model selector (declared ladders where the model metadata provides them, Off/Minimal/Low/Medium/High otherwise); Responses-only `muse-spark-*` models expose only upstream-supported effort levels, and no selection keeps the provider default
 - **Live catalog with a fallback chain** — live upstream list ∩ free-by-metadata, falling back to offline cache and a verified static list
 - **Self-healing** — fast startup retries, periodic refresh, and a written health snapshot for diagnostics
 - **Proper error surfaces** — upstream failures (rate limit, auth, timeout, transport) arrive in DSH as classified finish reasons, and retries stay owned by DSH
@@ -61,7 +61,8 @@ dsh plugin --profile web add ./opencode2dsh-dsh-plugin-<version>.tgz
 **Verify**: restart `dsh web`, open the model picker, and pick a model from
 the **opencode2dsh** group.
 
-Requires DSH (DeepSeek Harness) with a web profile; Node.js ≥ 20 (already
+Requires DSH (DeepSeek Harness) 0.1.7 or newer with a web profile (the IP 池
+settings page rides the 0.1.7 Plugins page contract); Node.js ≥ 20 (already
 present if DSH runs); outbound HTTPS to `opencode.ai` and `models.dev`.
 
 ## Configuration
@@ -139,7 +140,8 @@ The plugin writes a health snapshot after every refresh round:
 
 | Symptom | Likely cause & fix |
 | --- | --- |
-| Boot screen shows `Failed to load plugins … list slot "settings.plugin.item" requires options.id` | Your DSH is too old (≤ 0.1.0-rc.6): the settings-slot contract predates the plugin 0.3.0 browser half. Upgrade DSH to ≥ 0.1.0-rc.7 (latest recommended). Plugin ≥ 0.3.1 registers in either slot shape, so on old DSH you lose at most the settings card — model routing is unaffected. |
+| Boot screen shows `Failed to load plugins … list slot "plugins.item" requires options.id`, or the IP 池 entry has no configuration page | Your DSH predates the 0.1.7 Plugins page contract. Upgrade DSH to 0.1.7 (latest recommended). On 0.1.6 and older the page never mounts (it is gated on `configForms.whileServed`) — model routing is unaffected. |
+| DSH 0.1.7/0.2 cannot start after plugin installation (`pending … settingsScope`) | Upgrade the plugin to 0.3.5. On DSH 0.2, configure IP pooling through the installed opencode2dsh row on the Plugins page. |
 | Only 3 models | Startup fetch raced your network; retries land within ~1 min. Check `adapter-status.json` for `lastError`. |
 | `lastError: "fetch failed"` persisting | Outbound HTTPS to `opencode.ai` blocked; check proxy/VPN rules. |
 | Rate-limit errors in chat | The anonymous lane is quota-per-IP; switch network node or wait. |
@@ -158,7 +160,7 @@ The plugin writes a health snapshot after every refresh round:
 git clone https://github.com/FishBottle7/opencode2dsh.git
 cd opencode2dsh/packages/plugin
 pnpm install
-pnpm typecheck && pnpm test   # 44 unit tests
+pnpm typecheck && pnpm test
 pnpm build                    # bundle to lib/
 ```
 

@@ -1,36 +1,67 @@
 /**
- * IP 池 plugin card: one card inside 设置 → 插件 → 可配置插件 (the
- * `settings.plugin.item` slot keyed by the `ip-pool` namespace). Configuration
- * rides the OFFICIAL settings scope (rc.2 apiproxy serves every registered
- * namespace); runtime state and probe actions ride the plugin's loopback
- * bridge (/status, /probe). Every setting applies live on save — no restart
- * (docs/ip-pool.md §5).
+ * IP 池 page body: the editable form on the Plugins page (the `plugins.item`
+ * slot). Configuration rides the OFFICIAL settings form the Plugins page
+ * supplies (`ConfigPageForm`: a `ConfigFormSnapshot` plus `mutate`), so
+ * dsh-llm-proxy's loopback fallback compat layer is deliberately absent
+ * (docs/ip-pool.md §5, 2026-09-05 revision). Runtime state and probe actions
+ * ride the plugin's own bridge (/status, /models, /probe). Every setting
+ * applies live on save — no restart (docs/ip-pool.md §5).
+ *
+ * DSH 0.1.7: the Plugins page owns the card chrome, the one-liner and the save
+ * control, so this component returns the one-liner for `view: 'summary'` and
+ * the form for `view: 'page'`. The editable section is the `ipPool` volatile
+ * node, so the served value is `{ ipPool: ... }` and every write path is
+ * `['ipPool', <field>]`.
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
-import { IconChevronDownOutline14 } from '@deepseek-ai/dsh-client-ui-primitives'
-import type { InjectFace, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
-// Type-only: pulls the ui-settings-plugins SlotMap merge (the
-// 'settings.plugin.item' keyed entry the configurable tab declares at runtime).
-import type {} from '@deepseek-ai/dsh-client-ui-settings-plugins/client'
-import type { SettingsScope, SettingsScopeSnapshot } from '@deepseek-ai/dsh-client-runtime/client'
+import { SettingsForm, type SettingsFormShell } from '@deepseek-ai/dsh-client-ui-primitives'
+import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
+// Type-only: the Plugins page's SlotMap merge (the 'plugins.item' list entry,
+// whose owner hands this page its one-liner and its ConfigPageForm).
+import type {} from '@deepseek-ai/dsh-client-ui-plugin-manager/client'
+// Type-only: the settings provider's `ConfigFormSnapshot` and the page owner's
+// `ConfigPageForm`, the face this page now reads and writes through.
+import type { ConfigFormSnapshot } from '@deepseek-ai/dsh-client-ui-settings/client'
 import type { en } from './locales.ts'
 import styles from './ip-pool.module.css'
+import { fieldWrite, poolWriteOps, type FieldWrite } from './settings-writes.ts'
 
-/** Injected dependencies of the card (slot `inject`). */
-export interface IpPoolCardInjected {
-  /** The officially bound ip-pool settings scope (rc.2: always available). */
-  scope: SettingsScope<IpPoolSettingsValue>
-  /** uSES subscription hook bound to the scope snapshot. */
-  useSnapshot: () => SettingsScopeSnapshot<IpPoolSettingsValue>
-  /** Card copy. */
-  t: (key: keyof typeof en) => string
+/** The reactive values and commands the Plugins page supplies for this page. */
+export interface ConfigPageForm {
+  /** Accepted Host values, refreshed by the page owner. */
+  readonly state: ConfigFormSnapshot<Record<string, unknown>>
+  /** Submit field edits together with the revision the editor read. */
+  mutate(ops: readonly ConfigPathOp[], expectedRevision?: number): Promise<boolean>
 }
 
-/** Props delivered by the slot outlet (inject face spread flat). */
+/** One settings write, as the Host's path-op vocabulary spells it. */
+export type ConfigPathOp =
+  | { op: 'set'; path: string[]; value: unknown }
+  | { op: 'unset'; path: string[] }
+
+/**
+ * Props the Plugins page binds for the IP 池 page: the view it asked for, the
+ * locale copy, and — for `view: 'page'` — the entry's settings form.
+ */
 export type IpPoolCardProps =
-  PropsRuntime<'settings.plugin.item'>
-  & InjectFace<IpPoolCardInjected>
+  PropsRuntime<'plugins.item'>
+  & PropsLocale<'settings.ip-pool'>
+
+/** Copy of the form chrome (the shared SettingsForm labels). */
+const formLabels = (t: IpPoolCardProps['t']): {
+  unavailable: string
+  readOnly: string
+  saveFailed: string
+  save: string
+  saving: string
+} => ({
+  unavailable: t('statusUnavailable'),
+  readOnly: t('readOnly'),
+  saveFailed: t('saveError'),
+  save: t('save'),
+  saving: t('saving'),
+})
 
 /** The resolved ip-pool settings value (mirrors the schemastery schema). */
 export interface IpPoolSettingsValue {
@@ -40,6 +71,8 @@ export interface IpPoolSettingsValue {
   free: { enabled: boolean; targetSize: number; blockedCountries: string[] }
   manual: string[]
   subscription: { urls: string[]; refreshMs: number }
+  /** Previous composition spelling, migrated on a subscription edit. */
+  subscriptions?: string[]
   singbox: { path: string }
   pinnedExitId: string
   pinnedStrict: boolean
@@ -85,6 +118,14 @@ export interface PoolStatusView {
 /** The bridge prefix (same-origin, loopback-only on the host). */
 const BRIDGE_PREFIX = '/api/opencode2dsh/ip-pool'
 
+/**
+ * The field inside the served entry that holds the editable section: the
+ * `ipPool` volatile node in the plugin's Config schema. Every write path is
+ * `['ipPool', <field>]`, because the Host's volatile form keeps the node's
+ * field name in front of the fields it makes editable.
+ */
+const IP_POOL_FIELD = 'ipPool'
+
 const DEFAULTS: IpPoolSettingsValue = {
   enabled: false,
   probeModels: [],
@@ -103,11 +144,6 @@ const DEFAULTS: IpPoolSettingsValue = {
 function redactUrl(url: string): string {
   if (url.length <= 24) return url
   return url.slice(0, 12) + '…' + url.slice(-6)
-}
-
-/** JSON deep-equal over the card's plain values. */
-function deepEqual(a: unknown, b: unknown): boolean {
-  return JSON.stringify(a) === JSON.stringify(b)
 }
 
 /** Draft form state (strings for inputs; arrays kept as string lists). */
@@ -160,30 +196,48 @@ function formFromValue(value: IpPoolSettingsValue): FormState {
   }
 }
 
-/** Field writes landing the form on the resolved value, in write order. */
-interface FieldWrite { field: string; op: 'set'; value: unknown }
+/** The served entry's value: the `ipPool` volatile node is the whole form. */
+interface ServedEntry {
+  ipPool?: Partial<IpPoolSettingsValue>
+}
 
-function diffWrites(form: FormState, snapshot: SettingsScopeSnapshot<IpPoolSettingsValue>): FieldWrite[] {
-  const value = snapshot.value
-  const base = snapshot.base as Partial<IpPoolSettingsValue> | undefined
+/** Field writes landing the form on the resolved value, in write order. */
+
+/**
+ * The ip-pool section of the served value, with defaults filled. A missing
+ * section (an empty document, or a namespace the Host serves empty) reads as
+ * the documented defaults so the form still renders.
+ */
+function servedSection(state: ConfigFormSnapshot<Record<string, unknown>> | undefined): IpPoolSettingsValue {
+  const served = (state?.value as ServedEntry | undefined)?.ipPool
+  return {
+    ...DEFAULTS, ...served,
+    free: { ...DEFAULTS.free, ...served?.free },
+    subscription: { ...DEFAULTS.subscription, ...served?.subscription, ...(served?.subscriptions === undefined ? {} : { urls: served.subscriptions }) },
+    singbox: { ...DEFAULTS.singbox, ...served?.singbox },
+  }
+}
+
+/** The composition-side (base) ip-pool section, for the values a reset returns to. */
+function servedBase(state: ConfigFormSnapshot<Record<string, unknown>> | undefined): Partial<IpPoolSettingsValue> {
+  return servedSection({ ...state, value: state?.base } as ConfigFormSnapshot<Record<string, unknown>>)
+}
+
+function diffWrites(form: FormState, value: IpPoolSettingsValue, base: Partial<IpPoolSettingsValue>): FieldWrite[] {
   const writes: FieldWrite[] = []
   const push = (field: string, next: unknown, current: unknown, baseValue: unknown): void => {
-    if (deepEqual(next, current)) return
-    if (deepEqual(next, baseValue)) return // reverts inherit via unset, but the
-    // official scope only has set/unset per scalar field; a value equal to base
-    // still needs set (unset would drop user intent on other fields) — so no
-    // unset path here: set carries it.
-    writes.push({ field, op: 'set', value: next })
+    const edit = fieldWrite(field, next, current, baseValue)
+    if (edit !== undefined) writes.push(edit)
   }
-  push('enabled', form.enabled, value?.enabled, base?.enabled)
-  push('free', { enabled: form.freeEnabled, targetSize: Number(form.targetSize), blockedCountries: splitCsv(form.blockedCountries) }, value?.free, base?.free)
-  push('manual', form.manual, value?.manual, base?.manual)
-  push('subscription', { urls: form.subscriptionUrls, refreshMs: Number(form.refreshMs) }, value?.subscription, base?.subscription)
-  push('singbox', { path: form.singboxPath }, value?.singbox, base?.singbox)
-  push('pinnedExitId', form.pinnedExitId, value?.pinnedExitId, base?.pinnedExitId)
-  push('pinnedStrict', form.pinnedStrict, value?.pinnedStrict, base?.pinnedStrict)
-  push('probeModels', form.probeModels, value?.probeModels, base?.probeModels)
-  push('maxConcurrentProbes', Number(form.maxConcurrentProbes), value?.maxConcurrentProbes, base?.maxConcurrentProbes)
+  push('enabled', form.enabled, value.enabled, base.enabled)
+  push('free', { enabled: form.freeEnabled, targetSize: Number(form.targetSize), blockedCountries: splitCsv(form.blockedCountries) }, value.free, base.free)
+  push('manual', form.manual, value.manual, base.manual)
+  push('subscription', { urls: form.subscriptionUrls, refreshMs: Number(form.refreshMs) }, value.subscription, base.subscription)
+  push('singbox', { path: form.singboxPath }, value.singbox, base.singbox)
+  push('pinnedExitId', form.pinnedExitId, value.pinnedExitId, base.pinnedExitId)
+  push('pinnedStrict', form.pinnedStrict, value.pinnedStrict, base.pinnedStrict)
+  push('probeModels', form.probeModels, value.probeModels, base.probeModels)
+  push('maxConcurrentProbes', Number(form.maxConcurrentProbes), value.maxConcurrentProbes, base.maxConcurrentProbes)
   return writes
 }
 
@@ -194,7 +248,7 @@ function splitCsv(line: string): string[] {
 /** One-line live refill progress: stage + counters (docs §5.3). */
 function refillProgressLine(
   progress: NonNullable<PoolStatusView['refill']>['progress'],
-  t: IpPoolCardInjected['t'],
+  t: IpPoolCardProps['t'],
 ): string {
   const stageText: Record<typeof progress.stage, string> = {
     fetch: t('refillStageFetch'),
@@ -314,7 +368,7 @@ function ModelPicker(props: {
   hint: string
   models: Array<{ id: string; verified: boolean }>
   loading: boolean
-  t: IpPoolCardInjected['t']
+  t: IpPoolCardProps['t']
   onChange: (next: string[]) => void
 }): ReactNode {
   const { value, hint, models, loading, t, onChange } = props
@@ -368,7 +422,7 @@ function ModelPicker(props: {
 }
 
 /** Pool overview strip: four-state badge + counts + pinned badge. */
-function OverviewBar(props: { status: PoolStatusView | null; t: IpPoolCardInjected['t'] }): ReactNode {
+function OverviewBar(props: { status: PoolStatusView | null; t: IpPoolCardProps['t'] }): ReactNode {
   const { status, t } = props
   if (status === null) return null
   const stateLabel: Record<PoolStatusView['state'], string> = {
@@ -408,7 +462,7 @@ function OverviewBar(props: { status: PoolStatusView | null; t: IpPoolCardInject
 }
 
 /** The exit table + ban list. */
-function ExitTable(props: { status: PoolStatusView | null; t: IpPoolCardInjected['t']; onProbe: (exitId: string) => void; onPin: (exitId: string) => void; busy: boolean }): ReactNode {
+function ExitTable(props: { status: PoolStatusView | null; t: IpPoolCardProps['t']; onProbe: (exitId: string) => void; onPin: (exitId: string) => void; busy: boolean }): ReactNode {
   const { status, t, onProbe, onPin, busy } = props
   const [bansOpen, setBansOpen] = useState(false)
   if (status === null) return null
@@ -496,9 +550,9 @@ function ExitTable(props: { status: PoolStatusView | null; t: IpPoolCardInjected
 }
 
 /** The card body. */
-function CardBody(props: Required<IpPoolCardInjected>): ReactNode {
-  const { scope, useSnapshot, t } = props
-  const snapshot = useSnapshot()
+function CardBody(props: { settings: ConfigPageForm | undefined; t: IpPoolCardProps['t'] }): ReactNode {
+  const { settings, t } = props
+  const snapshot = settings?.state
   const [form, setForm] = useState<FormState>(() => emptyForm())
   const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
@@ -512,13 +566,18 @@ function CardBody(props: Required<IpPoolCardInjected>): ReactNode {
   const formRef = useRef(form)
   formRef.current = form
 
-  // Hydrate the form once from the first ready snapshot.
+  // The served section, with defaults filled.
+  const served = servedSection(snapshot)
+  const servedRef = useRef(served)
+  servedRef.current = served
+
+  // Hydrate the draft once from the first ready snapshot.
   useEffect(() => {
-    if (snapshot.status === 'ready' && !hydratedRef.current && snapshot.value !== undefined) {
+    if (snapshot?.status === 'ready' && !hydratedRef.current) {
       hydratedRef.current = true
-      setForm(formFromValue(snapshot.value))
+      setForm(formFromValue(servedRef.current))
     }
-  }, [snapshot.status, snapshot.value])
+  }, [snapshot?.status, snapshot?.value])
 
   // Fetch the probe-model options from the bridge once the body shows
   // (static S3 list first; live catalog rows merge in as they warm up).
@@ -553,17 +612,14 @@ function CardBody(props: Required<IpPoolCardInjected>): ReactNode {
     }
   }, [t])
   useEffect(() => {
-    if (snapshot.status !== 'ready' || !hydratedRef.current || !form.enabled) return
+    if (snapshot?.status !== 'ready' || !hydratedRef.current || !form.enabled) return
     void refreshStatus()
     const interval = setInterval(() => void refreshStatus(), probing || refilling ? 1_000 : 3_000)
     return () => clearInterval(interval)
-  }, [snapshot.status, form.enabled, probing, refilling, refreshStatus, hydratedRef.current]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [snapshot?.status, form.enabled, probing, refilling, refreshStatus, hydratedRef.current]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  if (snapshot.status === 'loading') {
+  if (snapshot?.status === 'loading') {
     return <p className={styles.status}>{t('statusLoading')}</p>
-  }
-  if (snapshot.status === 'unavailable') {
-    return <p className={styles.status}>{t('statusUnavailable')}</p>
   }
 
   const validate = (): string | null => {
@@ -588,14 +644,18 @@ function CardBody(props: Required<IpPoolCardInjected>): ReactNode {
     return null
   }
 
+  const writes = diffWrites(formRef.current, served, servedBase(snapshot))
+  const validation = validate()
+  const dirty = writes.length > 0 || validation !== null
+  const available = snapshot?.status === 'ready' && settings !== undefined
+  const writable = available && snapshot.writable
+
   const handleSave = async (): Promise<void> => {
-    const validation = validate()
-    if (validation !== null) {
+    if (!writable || validation !== null || settings === undefined || snapshot === undefined) {
       setSaved(false)
-      setError(validation)
+      setError(validation ?? t('saveError'))
       return
     }
-    const writes = diffWrites(formRef.current, snapshot)
     if (writes.length === 0) {
       setSaved(true)
       setError(null)
@@ -603,42 +663,35 @@ function CardBody(props: Required<IpPoolCardInjected>): ReactNode {
     }
     setSaving(true)
     setError(null)
-    let firstFailure: string | null = null
-    for (const write of writes) {
-      try {
-        await scope.set(write.field, write.value)
-      } catch (err) {
-        firstFailure ??= err instanceof Error ? err.message : t('saveError')
-      }
-    }
-    setSaving(false)
-    if (firstFailure === null) {
-      setSaved(true)
-    } else {
+    try {
+      const ok = await settings.mutate(
+        poolWriteOps(writes),
+        snapshot.revision,
+      )
+      setSaved(ok)
+      setError(ok ? null : t('saveError'))
+    } catch (err) {
       setSaved(false)
-      setError(firstFailure)
+      setError(err instanceof Error ? err.message : t('saveError'))
+    } finally {
+      setSaving(false)
     }
   }
 
-  const handleReset = async (): Promise<void> => {
-    setSaving(true)
+  /** The shared SettingsForm discard: drop the draft, keep the served values. */
+  const handleDiscard = (): void => {
+    setForm(formFromValue(servedRef.current))
+    setSaved(false)
     setError(null)
-    let firstFailure: string | null = null
-    for (const field of ['enabled', 'free', 'manual', 'subscription', 'singbox', 'pinnedExitId', 'pinnedStrict', 'probeModels', 'maxConcurrentProbes']) {
-      try {
-        await scope.unset(field)
-      } catch (err) {
-        firstFailure ??= err instanceof Error ? err.message : t('saveError')
-      }
-    }
-    setSaving(false)
-    if (firstFailure === null) {
-      setForm(formFromValue({ ...DEFAULTS, ...(snapshot.base as Partial<IpPoolSettingsValue> | undefined) } as IpPoolSettingsValue))
-      setSaved(true)
-    } else {
-      setSaved(false)
-      setError(firstFailure)
-    }
+  }
+
+  const shell: SettingsFormShell = {
+    available,
+    writable,
+    dirty,
+    invalid: validation !== null,
+    saving,
+    failed: error !== null,
   }
 
   /** One bridge action (/probe). */
@@ -656,9 +709,11 @@ function CardBody(props: Required<IpPoolCardInjected>): ReactNode {
 
   /** Pin an exit from the table: writes pinnedExitId and saves immediately. */
   const pinExit = async (exitId: string): Promise<void> => {
+    if (!writable || settings === undefined || snapshot === undefined) return
     setActionBusy(true)
     try {
-      await scope.set('pinnedExitId', exitId)
+      const accepted = await settings.mutate([{ op: 'set', path: [IP_POOL_FIELD, 'pinnedExitId'], value: exitId }], snapshot.revision)
+      if (!accepted) throw new Error(t('saveError'))
       setForm((current) => ({ ...current, pinnedExitId: exitId }))
     } catch (err) {
       setError(err instanceof Error ? err.message : t('saveError'))
@@ -671,6 +726,7 @@ function CardBody(props: Required<IpPoolCardInjected>): ReactNode {
   const probeTotal = status !== null ? status.prober.enqueued : 0
 
   return (
+    <SettingsForm labels={formLabels(t)} state={shell} onSave={() => { void handleSave() }} onDiscard={handleDiscard}>
     <div className={styles.body} data-testid="ip-pool-form">
       <OverviewBar status={form.enabled ? status : null} t={t} />
 
@@ -891,61 +947,25 @@ function CardBody(props: Required<IpPoolCardInjected>): ReactNode {
         </>
       )}
 
-      <div className={styles.footer}>
-        <button
-          type="button"
-          className={styles.primaryButton}
-          data-testid="save-ip-pool"
-          disabled={saving || !snapshot.writable}
-          onClick={() => { void handleSave() }}
-        >
-          {saving ? t('saving') : t('save')}
-        </button>
-        <button
-          type="button"
-          className={styles.ghostButton}
-          data-testid="reset-ip-pool"
-          disabled={saving || !snapshot.writable}
-          onClick={() => { void handleReset() }}
-        >
-          {t('reset')}
-        </button>
-        {statusError !== null && <span className={styles.saveStatusError}>{statusError}</span>}
-        {saved && !error && <span className={`${styles.saveStatus} ${styles.saveStatusOk}`}>{t('saved')}</span>}
-        {error !== null && <span className={`${styles.saveStatus} ${styles.saveStatusError}`}>{t('saveError')}：{error}</span>}
-      </div>
+      {statusError !== null && <span className={styles.saveStatusError}>{statusError}</span>}
+      {saved && error === null && <span className={`${styles.saveStatus} ${styles.saveStatusOk}`}>{t('saved')}</span>}
 
       <p className={styles.compliance}>{t('copyCompliance')}</p>
     </div>
+    </SettingsForm>
   )
 }
 
 /**
- * The IP 池 plugin card. Renders nothing until the slot outlet supplies the
- * inject face; the section stacks cards and reports their count.
+ * The IP 池 page on the Plugins page (`plugins.item`).
+ *
+ * The Plugins page owns the card chrome and the save control: for
+ * `view: 'summary'` this returns the one-liner the page shows under the entry
+ * title, and for `view: 'page'` it returns the form bound to the entry's
+ * served settings.
  */
 export function IpPoolCard(props: IpPoolCardProps): ReactNode {
-  const { scope, useSnapshot, t } = props
-  const [open, setOpen] = useState(false)
-  useMemo(() => undefined, []) // keep React import meaningful for jsx-runtime parity
-  if (scope === undefined || useSnapshot === undefined || t === undefined) return null
-  return (
-    <li className={styles.card}>
-      <button
-        type="button"
-        className={styles.header}
-        aria-expanded={open}
-        aria-label={`${t(open ? 'collapse' : 'expand')}: ${t('title')}`}
-        data-testid="ip-pool-card-header"
-        onClick={() => setOpen((current) => !current)}
-      >
-        <span className={styles.headText}>
-          <span className={styles.name}>{t('title')}</span>
-          <span className={styles.description}>{t('description')}</span>
-        </span>
-        <IconChevronDownOutline14 className={styles.chevron + (open ? ` ${styles.chevronOpen}` : '')} />
-      </button>
-      {open && <CardBody scope={scope} useSnapshot={useSnapshot} t={t} />}
-    </li>
-  )
+  const { form, t, view } = props
+  if (view === 'summary') return <>{t('description')}</>
+  return <CardBody settings={form} t={t} />
 }

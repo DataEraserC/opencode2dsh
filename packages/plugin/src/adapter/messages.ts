@@ -1,7 +1,14 @@
+import { apiForModel } from './routing.ts'
+import { readFile } from 'node:fs/promises'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+
 /**
  * Harness GenerateOptions -> pi-ai Context conversion (clean-room version of
- * dsh-llm-pi-ai's textOnlyContext, scoped to text-only models: dsh-llm strips
- * images before dispatch when the model declares text-only input modalities).
+ * dsh-llm-pi-ai's textOnlyContext). Unlike the host's text-only projection,
+ * user and tool-result image blocks are kept: the adapter declares image
+ * input modalities, so dsh-llm forwards them untouched and the bytes load
+ * from the harness attachment store here.
  */
 
 export interface HarnessTool {
@@ -31,6 +38,7 @@ export interface HarnessGenerateOptions {
   tools?: HarnessTool[]
   maxTokens?: number
   temperature?: number
+  reasoning?: string
   reasoningEffort?: string
   signal?: AbortSignal
   [key: string]: unknown
@@ -38,11 +46,11 @@ export interface HarnessGenerateOptions {
 
 /** pi-ai message vocabulary (subset we emit). */
 export type PiMessage =
-  | { role: 'user'; content: string; timestamp: number }
+  | { role: 'user'; content: string | PiContentBlock[]; timestamp: number }
   | {
       role: 'assistant'
       content: PiAssistantBlock[]
-      api: 'openai-completions'
+      api: 'openai-completions' | 'openai-responses'
       provider: string
       model: string
       usage: PiUsage
@@ -100,6 +108,88 @@ function parseArguments(raw: string): Record<string, unknown> {
   }
 }
 
+/**
+ * Harness attachment root (mirrors dsh-attachment-local's resolveDshHome).
+ * DSH_HOME is always set by the harness child; the homedir fallback covers
+ * direct invocation (tests, tooling).
+ */
+function dshHome(): string {
+  const configured = process.env.DSH_HOME?.trim()
+  if (configured) return configured
+  return join(homedir(), '.dsh')
+}
+
+/**
+ * Convert one harness image block to pi-ai ImageContent by reading the
+ * content-addressed normalized object (DSH_HOME/attachments/v1/objects/<2>/<sha>).
+ * Falls back to stable text on any failure so a missing object can never
+ * fail the whole stream.
+ */
+async function toPiImage(ref: unknown): Promise<PiContentBlock> {
+  const attachment = (ref ?? {}) as { attachmentId?: unknown; mediaType?: unknown }
+  const id = typeof attachment.attachmentId === 'string' ? attachment.attachmentId : ''
+  const sha = id.startsWith('sha256:') ? id.slice(7) : id
+  if (!/^[0-9a-f]{64}$/.test(sha)) {
+    return { type: 'text', text: `[image omitted: unreadable attachment reference ${JSON.stringify(id)}]` }
+  }
+  const path = join(dshHome(), 'attachments', 'v1', 'objects', sha.slice(0, 2), sha)
+  try {
+    const bytes = await readFile(path)
+    return {
+      type: 'image',
+      data: bytes.toString('base64'),
+      mimeType: typeof attachment.mediaType === 'string' && attachment.mediaType.length > 0 ? attachment.mediaType : 'image/png',
+    }
+  } catch {
+    return { type: 'text', text: `[image omitted: failed to read normalized attachment ${JSON.stringify(id)}]` }
+  }
+}
+
+/**
+ * Host-budget-offloaded images were routed out of the request by dsh-llm on
+ * purpose (`offloaded: true`); re-reading their bytes from disk would defy the
+ * image budget the host already enforced. Emit a stable placeholder instead —
+ * the same semantics as the host adapter's projectOffloadedImages.
+ */
+function offloadedImagePart(ref: unknown): PiContentBlock {
+  const id = (ref as { attachmentId?: unknown } | null | undefined)?.attachmentId
+  const short = typeof id === 'string' && id.length > 0 ? ` ${id.slice(0, 30)}` : ''
+  return { type: 'text', text: `[image omitted: offloaded to fit the request image budget${short}]` }
+}
+
+/** One image block, respecting the host's offload flag. */
+async function imagePart(block: { type?: unknown; attachment?: unknown; offloaded?: unknown }): Promise<PiContentBlock> {
+  return block.offloaded === true ? offloadedImagePart(block.attachment) : toPiImage(block.attachment)
+}
+
+/** Text/image parts of one user message's content, in block order. */
+async function userParts(blocks: HarnessBlock[]): Promise<PiContentBlock[]> {
+  const parts: PiContentBlock[] = []
+  for (const block of blocks) {
+    if (block.type === 'text') {
+      if (block.text.length > 0) parts.push({ type: 'text', text: block.text })
+    } else if (block.type === 'image') {
+      parts.push(await imagePart(block))
+    }
+  }
+  return parts
+}
+
+/** Text/image parts of one tool result's content, walking nested results. */
+async function toolResultParts(blocks: HarnessBlock[]): Promise<PiContentBlock[]> {
+  const parts: PiContentBlock[] = []
+  for (const block of blocks) {
+    if (block.type === 'text') {
+      parts.push({ type: 'text', text: block.text })
+    } else if (block.type === 'image') {
+      parts.push(await imagePart(block))
+    } else if (block.type === 'tool-result') {
+      parts.push(...(await toolResultParts(block.content)))
+    }
+  }
+  return parts
+}
+
 function toPiAssistant(message: HarnessMessage, providerId: string): Extract<PiMessage, { role: 'assistant' }> {
   const content: PiAssistantBlock[] = []
   for (const block of message.content) {
@@ -114,18 +204,19 @@ function toPiAssistant(message: HarnessMessage, providerId: string): Extract<PiM
         content.push({ type: 'toolCall', id: block.id, name: block.name, arguments: parseArguments(block.arguments) })
         break
       case 'image':
-        throw new Error('opencode2dsh: assistant image output cannot be replayed to a text-only model')
+        break // assistant images are not replayable; drop rather than fail the stream
       default:
         break
     }
   }
   const source = message.source
+  const model = source?.kind === 'model' && typeof source.model === 'string' ? source.model : providerId
   return {
     role: 'assistant',
     content,
-    api: 'openai-completions',
+    api: apiForModel(model),
     provider: source?.kind === 'model' && typeof source.provider === 'string' ? source.provider : providerId,
-    model: source?.kind === 'model' && typeof source.model === 'string' ? source.model : providerId,
+    model,
     usage: zeroUsage(),
     stopReason: content.some((block) => block.type === 'toolCall') ? 'toolUse' : 'stop',
     timestamp: 0,
@@ -139,18 +230,13 @@ function flattenText(message: HarnessMessage): string {
     .join('')
 }
 
-function toolResultText(blocks: HarnessBlock[]): string {
-  return blocks
-    .map((block) => (block.type === 'text' ? block.text : block.type === 'tool-result' ? toolResultText(block.content) : ''))
-    .join('')
-}
-
 /**
- * Convert the harness conversation into a pi-ai Context. Mirrors
- * textOnlyContext: text-only user content, tool results as toolResult
- * messages, assistant history as pi-ai assistant messages.
+ * Convert the harness conversation into a pi-ai Context. User and tool-result
+ * messages keep text AND image blocks (images load from the harness
+ * attachment store); tool results as toolResult messages, assistant history as
+ * pi-ai assistant messages. Async because image bytes are read from disk.
  */
-export function toPiContext(options: HarnessGenerateOptions): PiContext {
+export async function toPiContext(options: HarnessGenerateOptions): Promise<PiContext> {
   const providerId = options.provider
   const toolNames = new Map<string, string>()
   const messages: PiMessage[] = []
@@ -168,19 +254,28 @@ export function toPiContext(options: HarnessGenerateOptions): PiContext {
       messages.push(assistant)
       continue
     }
-    const text = flattenText(message)
+    const parts = await userParts(message.content)
     const results = message.content.filter((block) => block.type === 'tool-result') as Array<
       Extract<HarnessBlock, { type: 'tool-result' }>
     >
-    if (text.length > 0 || results.length === 0) {
-      messages.push({ role: 'user', content: text, timestamp: 0 })
+    if (parts.length > 0 || results.length === 0) {
+      const first = parts[0]
+      let content: string | PiContentBlock[]
+      if (parts.length === 0) content = ''
+      else if (parts.length === 1 && first?.type === 'text') content = first.text
+      else content = parts
+      messages.push({ role: 'user', content, timestamp: 0 })
     }
     for (const result of results) {
+      let rparts = await toolResultParts(result.content)
+      const hasImage = rparts.some((part) => part.type === 'image')
+      const hasText = rparts.some((part) => part.type === 'text' && part.text.length > 0)
+      if (!hasImage && !hasText) rparts = [{ type: 'text', text: '(no output)' }]
       messages.push({
         role: 'toolResult',
         toolCallId: result.toolCallId,
         toolName: toolNames.get(result.toolCallId) ?? 'unknown',
-        content: [{ type: 'text', text: toolResultText(result.content) || '(no output)' }],
+        content: rparts,
         isError: result.isError ?? false,
         timestamp: 0,
       })
@@ -216,6 +311,27 @@ export function freeLaneGateTool(name: (typeof FREE_LANE_GATE_TOOL_NAMES)[number
       description: 'Reserved for the host runtime; do not call it.',
       parameters: { type: 'object', properties: {} },
     },
+  }
+}
+
+/** Responses uses flat function tools and its Zen gateway accepts auto only. */
+export function ensureResponsesFreeLaneShape(payload: unknown): unknown | undefined {
+  if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return undefined
+  const body = payload as Record<string, unknown>
+  if (!Array.isArray(body.input)) return undefined
+  const tools = Array.isArray(body.tools) ? body.tools as unknown[] : []
+  const names = new Set(tools.map((tool) => {
+    if (typeof tool !== 'object' || tool === null) return undefined
+    const candidate = tool as { type?: unknown; name?: unknown }
+    return candidate.type === 'function' ? candidate.name : undefined
+  }))
+  const missing = FREE_LANE_GATE_TOOL_NAMES.filter((name) => !names.has(name))
+  const invalidChoice = body.tool_choice !== undefined && body.tool_choice !== 'auto'
+  if (missing.length === 0 && !invalidChoice) return undefined
+  return {
+    ...body,
+    tools: [...tools, ...missing.map((name) => ({ type: 'function', ...freeLaneGateTool(name).function }))],
+    tool_choice: 'auto',
   }
 }
 

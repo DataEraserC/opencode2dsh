@@ -1,15 +1,18 @@
 /**
- * IP-5 live-apply tests: the apply controller over a fake settings seam —
- * boot-time enable, watcher-driven reconfigure (enabled flip included) and
- * the section-shape mapping from either layer's spelling. The real
- * startIpPool is replaced through the assemble seam, so no undici or global
- * dispatcher is ever installed.
+ * IP-5 live-apply tests: the apply controller over the DSH 0.1.7 settings
+ * model — a stable volatile reference plus `loader/volatile-update` instead of
+ * the 0.1.1 `ctx.settings.register()/watch()` scope. Boot-time enable,
+ * event-driven reconfigure (enabled flip included) and the section-shape
+ * mapping from either layer's spelling. The real startIpPool is replaced
+ * through the assemble seam, so no undici or global dispatcher is ever
+ * installed.
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import { applyIpPoolSettings, type AssembleIpPool } from '../src/ip-pool-settings/apply.ts'
-import { IpPoolConfigSchema } from '../src/ip-pool-settings/namespace.ts'
+import { IP_POOL_NAMESPACE, resolveIpPoolSettings, type AnyIpPoolSection, type IpPoolSettings, type VolatileRef } from '../src/ip-pool-settings/namespace.ts'
+import { resolveConfig, type OrdinaryPluginConfig } from '../src/config.ts'
 import type { PluginContext } from '../src/index.ts'
 
 /** Recorded assembly + reconfigure calls (reset per test). */
@@ -40,98 +43,206 @@ const assemble: AssembleIpPool = async (config) => {
   return runtime as never
 }
 
-/** Fake settings seam with the register/watch face (dsh-settings shaped). */
-function makeFakeSeam() {
-  const watchers = new Set<(next: unknown) => void>()
-  let resolved: Record<string, unknown> = {}
-  const seam = {
-    get: () => resolved,
-    mutate: async () => {},
-    register(ns: string, _schema: unknown, options: { base?: unknown }) {
-      assert.equal(String(ns), 'ip-pool')
-      resolved = { ...(options?.base as object) }
-      return {
-        get: () => resolved,
-        watch(callback: (next: unknown) => void) {
-          watchers.add(callback)
-          return () => watchers.delete(callback)
-        },
-      }
-    },
-  }
-  return {
-    seam,
-    commit(next: Record<string, unknown>) {
-      resolved = next
-      for (const callback of watchers) callback(next)
-    },
-  }
-}
+/** The ordinary half of a config, as the Loader would resolve it. */
+const ordinary = (over: Partial<OrdinaryPluginConfig> = {}): OrdinaryPluginConfig =>
+  resolveConfig({ ...over } as never)
 
-function fakeCtx(seam: unknown): PluginContext {
-  return {
+/**
+ * A DSH 0.1.7-shaped host: the Loader hands `apply()` a stable volatile
+ * reference, commits a settings save into it, and announces it with
+ * `loader/volatile-update`. No `register`, no `watch` — the 0.1.7 contract.
+ */
+function makeVolatileHost(initial?: AnyIpPoolSection) {
+  let current: IpPoolSettings = resolveIpPoolSettings(initial)
+  const listeners = new Set<() => void>()
+  const ref: VolatileRef<IpPoolSettings> = { get: () => current }
+
+  const ctx: PluginContext = {
     logger: { info() {}, warn() {}, error() {} },
-    settings: seam as never,
+    on(event: string, listener: () => void) {
+      assert.equal(event, 'loader/volatile-update')
+      listeners.add(listener)
+      return () => listeners.delete(listener)
+    },
+  }
+
+  return {
+    ctx,
+    ref,
+    get value(): IpPoolSettings { return current },
+    /** Simulate a settings-page save: commit into the ref, then announce. */
+    commit(next: AnyIpPoolSection): void {
+      current = resolveIpPoolSettings({ ...current, ...next })
+      for (const listener of [...listeners]) listener()
+    },
   }
 }
 
-test('disabled at boot: namespace registers, no runtime assembled', async () => {
+const tick = (ms = 30): Promise<void> => new Promise((r) => setTimeout(r, ms))
+
+test('edits during pool startup share one runtime and apply the latest value', async () => {
+  const host = makeVolatileHost({ enabled: true })
+  let release = (): void => {}
+  const gate = new Promise<void>((done) => { release = done })
+  let starts = 0
+  const applied: unknown[] = []
+  applyIpPoolSettings(host.ctx, ordinary(), () => host.ref.get(), host.ctx.logger, { assemble: async () => {
+    starts++
+    await gate
+    return { reconfigure: async (config: unknown) => { applied.push(config) }, dispose: async () => {} } as never
+  } })
+  host.commit({ enabled: true, manual: ['http://127.0.0.1:7897'] })
+  host.commit({ enabled: false })
+  release()
+  await tick()
+  assert.equal(starts, 1)
+  assert.ok(applied.length > 0)
+  for (const config of applied as Array<{ ipPool: { enabled: boolean; manual: string[] } }>) {
+    assert.equal(config.ipPool.enabled, false)
+    assert.deepEqual(config.ipPool.manual, ['http://127.0.0.1:7897'])
+  }
+})
+
+test('unloading while the pool starts disposes the late runtime', async () => {
+  const host = makeVolatileHost({ enabled: true })
+  const effects: Array<() => void> = []
+  host.ctx.effect = (fn) => { effects.push(fn()) }
+  let release = (): void => {}
+  const gate = new Promise<void>((done) => { release = done })
+  let disposed = false
+  const controller = applyIpPoolSettings(host.ctx, ordinary(), () => host.ref.get(), host.ctx.logger, { assemble: async () => {
+    await gate
+    return { reconfigure: async () => { assert.fail('a disposed plugin must not reconfigure') }, dispose: async () => { disposed = true } } as never
+  } })
+  for (const dispose of effects) dispose()
+  release()
+  await tick()
+  assert.equal(disposed, true)
+  assert.equal(controller.runtime, null)
+})
+
+test('the served namespace is the Loader entry id, not a hand-registered "ip-pool"', () => {
+  assert.equal(IP_POOL_NAMESPACE, 'opencode2dsh')
+})
+
+test('disabled at boot: nothing assembles', async () => {
   resetCalls()
-  const { seam } = makeFakeSeam()
-  const ctx = fakeCtx(seam)
-  const controller = applyIpPoolSettings(ctx, {}, ctx.logger, { assemble })
-  await new Promise((r) => setTimeout(r, 20))
+  const host = makeVolatileHost()
+  const controller = applyIpPoolSettings(host.ctx, ordinary(), () => host.ref.get(), host.ctx.logger, { assemble })
+  await tick(20)
   assert.equal(starts.length, 0)
   assert.equal(controller.runtime, null)
 })
 
-test('boot-enabled: runtime assembles once with the entry config', async () => {
+test('boot-enabled: runtime assembles once from the resolved volatile value', async () => {
   resetCalls()
-  const { seam } = makeFakeSeam()
-  const ctx = fakeCtx(seam)
-  const config = { ipPool: { enabled: true, manual: ['http://1.1.1.1:1'] } } as never
-  const controller = applyIpPoolSettings(ctx, config, ctx.logger, { assemble })
-  await new Promise((r) => setTimeout(r, 30))
+  const host = makeVolatileHost({ enabled: true, manual: ['http://1.1.1.1:1'] })
+  const controller = applyIpPoolSettings(host.ctx, ordinary(), () => host.ref.get(), host.ctx.logger, { assemble })
+  await tick(30)
   assert.equal(starts.length, 1)
   assert.ok(controller.runtime !== null)
   const passed = starts[0]!.config as { ipPool?: { manual?: string[] } }
   assert.deepEqual(passed.ipPool?.manual, ['http://1.1.1.1:1'])
 })
 
-test('settings-page enable: commit assembles the runtime, later commits reconfigure live', async () => {
+test('a persisted enabled:true assembles at boot even with a disabled entry config', async () => {
+  // The old namespace model got this for free (register() took the persisted
+  // document as its base). The volatile reference carries the same fact, and
+  // reading only the entry config would strand the pool until the next save.
   resetCalls()
-  const { seam, commit } = makeFakeSeam()
-  const ctx = fakeCtx(seam)
-  const controller = applyIpPoolSettings(ctx, {}, ctx.logger, { assemble })
-  await new Promise((r) => setTimeout(r, 10))
+  const host = makeVolatileHost({ enabled: true })
+  applyIpPoolSettings(host.ctx, ordinary(), () => host.ref.get(), host.ctx.logger, { assemble })
+  await tick(30)
+  assert.equal(starts.length, 1)
+})
+
+test('settings-page enable: volatile-update assembles, later commits reconfigure live', async () => {
+  resetCalls()
+  const host = makeVolatileHost()
+  const controller = applyIpPoolSettings(host.ctx, ordinary(), () => host.ref.get(), host.ctx.logger, { assemble })
+  await tick(10)
   assert.equal(starts.length, 0)
 
-  // flip enabled on (settings-page shape)
-  commit(IpPoolConfigSchema({ enabled: true, manual: ['http://2.2.2.2:2'], maxConcurrentProbes: 5 }) as never)
-  await new Promise((r) => setTimeout(r, 30))
+  host.commit({ enabled: true, manual: ['http://2.2.2.2:2'], maxConcurrentProbes: 5 })
+  await tick(30)
   assert.equal(starts.length, 1, 'enable commit assembles the runtime')
   assert.ok(controller.runtime !== null)
 
-  // a later commit (no enable flip) goes through reconfigure, never re-assembles
+  // A later commit (no enable flip) goes through reconfigure, never re-assembles.
   const before = starts.length
-  commit(IpPoolConfigSchema({ enabled: true, manual: ['http://2.2.2.2:2'], pinnedExitId: 'http://127.0.0.1:7897', pinnedStrict: true }) as never)
-  await new Promise((r) => setTimeout(r, 30))
+  host.commit({ pinnedExitId: 'http://127.0.0.1:7897', pinnedStrict: true })
+  await tick(30)
   assert.equal(starts.length, before, 'no re-assembly without an enable flip')
-  // one reconfigure per commit: the enable commit's post-assembly apply + this one
   assert.equal(reconfigures.length, 2)
   const applied = reconfigures[1]!.ipPool as Record<string, unknown>
   assert.equal(applied.pinnedExitId, 'http://127.0.0.1:7897')
   assert.equal(applied.pinnedStrict, true)
 })
 
+test('every field the runtime reads survives the settings->config round trip', async () => {
+  // Reconfigure consumes this shape, so a field dropped by toIpPoolConfig()
+  // resets to its default on every commit — silently, and only in adapter
+  // mode, which is the shipped default.
+  resetCalls()
+  const host = makeVolatileHost()
+  applyIpPoolSettings(host.ctx, ordinary(), () => host.ref.get(), host.ctx.logger, { assemble })
+  host.commit({
+    enabled: true,
+    maxConcurrentProbes: 7,
+    subscription: { urls: ['https://x/y'], refreshMs: 60_000 },
+  })
+  await tick(30)
+  const applied = starts[0]!.config.ipPool as Record<string, unknown>
+  assert.equal(applied.maxConcurrentProbes, 7, 'probe concurrency must reach the runtime')
+  assert.deepEqual(applied.subscription, { refreshMs: 60_000 }, 'subscription interval must reach the runtime')
+  assert.deepEqual(applied.subscriptions, ['https://x/y'])
+})
+
 test('subscription urls from the settings shape flow into the config assembly', async () => {
   resetCalls()
-  const { seam, commit } = makeFakeSeam()
-  const ctx = fakeCtx(seam)
-  applyIpPoolSettings(ctx, {}, ctx.logger, { assemble })
-  commit(IpPoolConfigSchema({ enabled: true, subscription: { urls: ['https://x/y'] } }) as never)
-  await new Promise((r) => setTimeout(r, 30))
+  const host = makeVolatileHost()
+  applyIpPoolSettings(host.ctx, ordinary(), () => host.ref.get(), host.ctx.logger, { assemble })
+  host.commit({ enabled: true, subscription: { urls: ['https://x/y'] } })
+  await tick(30)
   assert.equal(starts.length, 1)
   const passed = starts[0]!.config as { ipPool?: { subscriptions?: string[] } }
   assert.deepEqual(passed.ipPool?.subscriptions, ['https://x/y'])
+})
+
+test('an absent volatile reference degrades to defaults instead of throwing', async () => {
+  // A host predating the `Config` export hands over no reference at all.
+  resetCalls()
+  const host = makeVolatileHost()
+  const controller = applyIpPoolSettings(host.ctx, ordinary(), () => undefined, host.ctx.logger, { assemble })
+  await tick(20)
+  assert.equal(controller.settings().enabled, false)
+  assert.equal(starts.length, 0)
+})
+
+test('the settings page is claimed lazily and never gates the fiber', async () => {
+  // `settings` stays out of `inject`: SettingsForms needs a profileContext and
+  // ships disabled headless, so demanding it up front kept the provider route
+  // from ever activating. configure({ auto: false }) is requested on demand.
+  resetCalls()
+  const configureCalls: Array<unknown> = []
+  const injections: string[][] = []
+  const host = makeVolatileHost()
+  const ctx: PluginContext = {
+    logger: { info() {}, warn() {}, error() {} },
+    on: host.ctx.on,
+    inject(services, callback) {
+      injections.push([...services])
+      if (services.includes('settings')) {
+        callback({
+          logger: { info() {}, warn() {}, error() {} },
+          settings: { configure: (presentation: unknown) => { configureCalls.push(presentation); return () => {} } },
+        })
+      }
+    },
+  }
+  applyIpPoolSettings(ctx, ordinary(), () => undefined, ctx.logger, { assemble })
+  await tick(10)
+  assert.ok(injections.some((list) => list.includes('settings')), 'settings is requested on demand')
+  assert.equal(injections.some((list) => list.includes('webServer')), true, 'webServer is still requested for the bridge')
+  assert.deepEqual(configureCalls, [{ auto: false }], 'the plugin serves its own IP 池 card')
 })

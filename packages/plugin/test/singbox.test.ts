@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { ANYTLS_SUBSCRIPTION } from './fixtures/anytls.ts'
 
 import { buildOutbound, generateConfig, nodeKeyOf, SingBoxSupervisor } from '../src/pool/singbox.ts'
 import { parseSubscription, type ParsedNode } from '../src/pool/subscription.ts'
@@ -117,7 +117,7 @@ test('generateConfig: unsupported nodes are skipped without burning a port', () 
 // -- conversion pipeline (fetcher + supervisor seam) ---------------------------
 
 test('subscription refresh with supervisor: encrypted nodes convert and smoke into the pool', async () => {
-  const fixture = readFileSync('C:/Users/FishBottle/AppData/Local/Temp/GoProxy/subscriptions/sub_1775301718713.yaml', 'utf8')
+  const fixture = ANYTLS_SUBSCRIPTION
   const report = parseSubscription(fixture)
   assert.equal(report.nodes.length, 38)
 
@@ -179,7 +179,7 @@ test('subscription refresh with supervisor: encrypted nodes convert and smoke in
 })
 
 test('subscription refresh without supervisor: encrypted nodes park as pending', async () => {
-  const fixture = readFileSync('C:/Users/FishBottle/AppData/Local/Temp/GoProxy/subscriptions/sub_1775301718713.yaml', 'utf8')
+  const fixture = ANYTLS_SUBSCRIPTION
   const pool = new ExitPool()
   const prober = new Prober({ pool })
   const fetcher = new SubscriptionFetcher(
