@@ -232,6 +232,11 @@ export class ZenAdapter {
     return undefined
   }
 
+  /** No image pricing for the free Zen lane. */
+  imageRequestPricing(_provider: string, _model: string): undefined {
+    return undefined
+  }
+
   /** Advisory catalog for the DSH model picker (deduped; dsh-llm rejects duplicates). */
   listModels(provider: string): Array<{ provider: string; id: string; name: string; inputModalities: string[] }> {
     const seen = new Set<string>()
