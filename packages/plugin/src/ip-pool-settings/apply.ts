@@ -55,6 +55,8 @@ export function applyIpPoolSettings(
   deps: { assemble?: AssembleIpPool; listLiveModels?: () => string[] } = {},
 ): IpPoolController {
   const assemble = deps.assemble ?? defaultAssemble
+  let disposed = false
+  let starting: Promise<void> | undefined
   const controller: IpPoolController = {
     runtime: null,
     settings: () => resolveIpPoolSettings(readIpPool()),
@@ -63,8 +65,14 @@ export function applyIpPoolSettings(
 
   /** Assemble on first enable; reuse across later commits (live reconfigure). */
   const ensureRuntime = async (): Promise<void> => {
-    if (controller.runtime !== null) return
-    controller.runtime = await assemble(controller.asConfig(controller.settings()), logger)
+    if (disposed || controller.runtime !== null) return
+    if (starting !== undefined) return starting
+    starting = (async () => {
+      const runtime = await assemble(controller.asConfig(controller.settings()), logger)
+      if (disposed) await runtime?.dispose()
+      else controller.runtime = runtime
+    })()
+    try { await starting } finally { starting = undefined }
   }
 
   // Cold-start ordering: the Loader has already resolved schema defaults, the
@@ -73,10 +81,11 @@ export function applyIpPoolSettings(
   // — not only after the next settings-page save. The entry config alone
   // cannot see the persisted value; `readIpPool()` can.
   const applyCommitted = (value: IpPoolSettings): void => {
+    if (disposed) return
     const rt = controller.runtime
     if (value.enabled && rt === null) {
       void ensureRuntime()
-        .then(() => controller.runtime?.reconfigure(controller.asConfig(value)))
+        .then(() => controller.runtime?.reconfigure(controller.asConfig(controller.settings())))
         .catch((err) => {
           logger.warn(`opencode2dsh: ip pool start failed: ${err instanceof Error ? err.message : String(err)}`)
         })
@@ -162,6 +171,7 @@ export function applyIpPoolSettings(
   const maybeEffect = (ctx as { effect?: PluginContext['effect'] }).effect
   if (typeof maybeEffect === 'function') {
     maybeEffect.call(ctx, () => () => {
+      disposed = true
       void controller.runtime?.dispose()
       controller.runtime = null
     })

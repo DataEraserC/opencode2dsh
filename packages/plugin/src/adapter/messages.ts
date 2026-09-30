@@ -1,3 +1,4 @@
+import { apiForModel } from './routing.ts'
 import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
@@ -37,6 +38,7 @@ export interface HarnessGenerateOptions {
   tools?: HarnessTool[]
   maxTokens?: number
   temperature?: number
+  reasoning?: string
   reasoningEffort?: string
   signal?: AbortSignal
   [key: string]: unknown
@@ -48,7 +50,7 @@ export type PiMessage =
   | {
       role: 'assistant'
       content: PiAssistantBlock[]
-      api: 'openai-completions'
+      api: 'openai-completions' | 'openai-responses'
       provider: string
       model: string
       usage: PiUsage
@@ -112,10 +114,9 @@ function parseArguments(raw: string): Record<string, unknown> {
  * direct invocation (tests, tooling).
  */
 function dshHome(): string {
-  if (typeof process !== 'undefined' && process.env?.DSH_HOME) return process.env.DSH_HOME
-  if (process.platform === 'win32') return join(homedir(), 'AppData', 'Roaming', 'dsh-desktop', 'harness')
-  if (process.platform === 'darwin') return join(homedir(), 'Library', 'Application Support', 'dsh-desktop', 'harness')
-  return join(homedir(), '.config', 'dsh-desktop', 'harness')
+  const configured = process.env.DSH_HOME?.trim()
+  if (configured) return configured
+  return join(homedir(), '.dsh')
 }
 
 /**
@@ -140,7 +141,7 @@ async function toPiImage(ref: unknown): Promise<PiContentBlock> {
       mimeType: typeof attachment.mediaType === 'string' && attachment.mediaType.length > 0 ? attachment.mediaType : 'image/png',
     }
   } catch {
-    return { type: 'text', text: `[image omitted: failed to read normalized attachment ${JSON.stringify(path)}]` }
+    return { type: 'text', text: `[image omitted: failed to read normalized attachment ${JSON.stringify(id)}]` }
   }
 }
 
@@ -209,12 +210,13 @@ function toPiAssistant(message: HarnessMessage, providerId: string): Extract<PiM
     }
   }
   const source = message.source
+  const model = source?.kind === 'model' && typeof source.model === 'string' ? source.model : providerId
   return {
     role: 'assistant',
     content,
-    api: 'openai-completions',
+    api: apiForModel(model),
     provider: source?.kind === 'model' && typeof source.provider === 'string' ? source.provider : providerId,
-    model: source?.kind === 'model' && typeof source.model === 'string' ? source.model : providerId,
+    model,
     usage: zeroUsage(),
     stopReason: content.some((block) => block.type === 'toolCall') ? 'toolUse' : 'stop',
     timestamp: 0,
@@ -309,6 +311,27 @@ export function freeLaneGateTool(name: (typeof FREE_LANE_GATE_TOOL_NAMES)[number
       description: 'Reserved for the host runtime; do not call it.',
       parameters: { type: 'object', properties: {} },
     },
+  }
+}
+
+/** Responses uses flat function tools and its Zen gateway accepts auto only. */
+export function ensureResponsesFreeLaneShape(payload: unknown): unknown | undefined {
+  if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return undefined
+  const body = payload as Record<string, unknown>
+  if (!Array.isArray(body.input)) return undefined
+  const tools = Array.isArray(body.tools) ? body.tools as unknown[] : []
+  const names = new Set(tools.map((tool) => {
+    if (typeof tool !== 'object' || tool === null) return undefined
+    const candidate = tool as { type?: unknown; name?: unknown }
+    return candidate.type === 'function' ? candidate.name : undefined
+  }))
+  const missing = FREE_LANE_GATE_TOOL_NAMES.filter((name) => !names.has(name))
+  const invalidChoice = body.tool_choice !== undefined && body.tool_choice !== 'auto'
+  if (missing.length === 0 && !invalidChoice) return undefined
+  return {
+    ...body,
+    tools: [...tools, ...missing.map((name) => ({ type: 'function', ...freeLaneGateTool(name).function }))],
+    tool_choice: 'auto',
   }
 }
 

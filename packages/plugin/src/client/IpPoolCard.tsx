@@ -25,6 +25,7 @@ import type {} from '@deepseek-ai/dsh-client-ui-plugin-manager/client'
 import type { ConfigFormSnapshot } from '@deepseek-ai/dsh-client-ui-settings/client'
 import type { en } from './locales.ts'
 import styles from './ip-pool.module.css'
+import { fieldWrite, poolWriteOps, type FieldWrite } from './settings-writes.ts'
 
 /** The reactive values and commands the Plugins page supplies for this page. */
 export interface ConfigPageForm {
@@ -70,6 +71,8 @@ export interface IpPoolSettingsValue {
   free: { enabled: boolean; targetSize: number; blockedCountries: string[] }
   manual: string[]
   subscription: { urls: string[]; refreshMs: number }
+  /** Previous composition spelling, migrated on a subscription edit. */
+  subscriptions?: string[]
   singbox: { path: string }
   pinnedExitId: string
   pinnedStrict: boolean
@@ -143,11 +146,6 @@ function redactUrl(url: string): string {
   return url.slice(0, 12) + '…' + url.slice(-6)
 }
 
-/** JSON deep-equal over the card's plain values. */
-function deepEqual(a: unknown, b: unknown): boolean {
-  return JSON.stringify(a) === JSON.stringify(b)
-}
-
 /** Draft form state (strings for inputs; arrays kept as string lists). */
 interface FormState {
   enabled: boolean
@@ -204,7 +202,6 @@ interface ServedEntry {
 }
 
 /** Field writes landing the form on the resolved value, in write order. */
-interface FieldWrite { field: string; op: 'set'; value: unknown }
 
 /**
  * The ip-pool section of the served value, with defaults filled. A missing
@@ -213,23 +210,24 @@ interface FieldWrite { field: string; op: 'set'; value: unknown }
  */
 function servedSection(state: ConfigFormSnapshot<Record<string, unknown>> | undefined): IpPoolSettingsValue {
   const served = (state?.value as ServedEntry | undefined)?.ipPool
-  return { ...DEFAULTS, ...(served ?? {}), ...(served?.free ? { free: { ...DEFAULTS.free, ...served.free } } : {}), ...(served?.subscription ? { subscription: { ...DEFAULTS.subscription, ...served.subscription } } : {}), ...(served?.singbox ? { singbox: { ...DEFAULTS.singbox, ...served.singbox } } : {}) } as IpPoolSettingsValue
+  return {
+    ...DEFAULTS, ...served,
+    free: { ...DEFAULTS.free, ...served?.free },
+    subscription: { ...DEFAULTS.subscription, ...served?.subscription, ...(served?.subscriptions === undefined ? {} : { urls: served.subscriptions }) },
+    singbox: { ...DEFAULTS.singbox, ...served?.singbox },
+  }
 }
 
 /** The composition-side (base) ip-pool section, for the values a reset returns to. */
 function servedBase(state: ConfigFormSnapshot<Record<string, unknown>> | undefined): Partial<IpPoolSettingsValue> {
-  return ((state?.base as ServedEntry | undefined)?.ipPool) ?? {}
+  return servedSection({ ...state, value: state?.base } as ConfigFormSnapshot<Record<string, unknown>>)
 }
 
 function diffWrites(form: FormState, value: IpPoolSettingsValue, base: Partial<IpPoolSettingsValue>): FieldWrite[] {
   const writes: FieldWrite[] = []
   const push = (field: string, next: unknown, current: unknown, baseValue: unknown): void => {
-    if (deepEqual(next, current)) return
-    if (deepEqual(next, baseValue)) return // reverts inherit via unset, but the
-    // official scope only has set/unset per scalar field; a value equal to base
-    // still needs set (unset would drop user intent on other fields) — so no
-    // unset path here: set carries it.
-    writes.push({ field, op: 'set', value: next })
+    const edit = fieldWrite(field, next, current, baseValue)
+    if (edit !== undefined) writes.push(edit)
   }
   push('enabled', form.enabled, value.enabled, base.enabled)
   push('free', { enabled: form.freeEnabled, targetSize: Number(form.targetSize), blockedCountries: splitCsv(form.blockedCountries) }, value.free, base.free)
@@ -650,10 +648,10 @@ function CardBody(props: { settings: ConfigPageForm | undefined; t: IpPoolCardPr
   const validation = validate()
   const dirty = writes.length > 0 || validation !== null
   const available = snapshot?.status === 'ready' && settings !== undefined
-  const writable = available && settings?.state.status === 'ready'
+  const writable = available && snapshot.writable
 
   const handleSave = async (): Promise<void> => {
-    if (validation !== null || settings === undefined || snapshot === undefined) {
+    if (!writable || validation !== null || settings === undefined || snapshot === undefined) {
       setSaved(false)
       setError(validation ?? t('saveError'))
       return
@@ -667,7 +665,7 @@ function CardBody(props: { settings: ConfigPageForm | undefined; t: IpPoolCardPr
     setError(null)
     try {
       const ok = await settings.mutate(
-        writes.map((write) => ({ op: write.op, path: [IP_POOL_FIELD, write.field], value: write.value }) as ConfigPathOp),
+        poolWriteOps(writes),
         snapshot.revision,
       )
       setSaved(ok)
@@ -711,10 +709,11 @@ function CardBody(props: { settings: ConfigPageForm | undefined; t: IpPoolCardPr
 
   /** Pin an exit from the table: writes pinnedExitId and saves immediately. */
   const pinExit = async (exitId: string): Promise<void> => {
-    if (settings === undefined || snapshot === undefined) return
+    if (!writable || settings === undefined || snapshot === undefined) return
     setActionBusy(true)
     try {
-      await settings.mutate([{ op: 'set', path: [IP_POOL_FIELD, 'pinnedExitId'], value: exitId }], snapshot.revision)
+      const accepted = await settings.mutate([{ op: 'set', path: [IP_POOL_FIELD, 'pinnedExitId'], value: exitId }], snapshot.revision)
+      if (!accepted) throw new Error(t('saveError'))
       setForm((current) => ({ ...current, pinnedExitId: exitId }))
     } catch (err) {
       setError(err instanceof Error ? err.message : t('saveError'))

@@ -1,6 +1,6 @@
 {
   "name": "@opencode2dsh/dsh-plugin",
-  "version": "0.3.4",
+  "version": "0.3.5",
   "description": "Free OpenCode Zen models for DeepSeek Harness (DSH): native dsh-llm adapter plugin, no API key.",
   "type": "module",
   "main": "lib/index.js",
@@ -38,12 +38,15 @@
         "@deepseek-ai/dsh-client-ui-settings",
         "@deepseek-ai/dsh-client-ui-plugin-manager"
       ],
-      "platform": "web"
+      "platform": "web",
+      "external": [
+        "@deepseek-ai/dsh-client-ui-primitives"
+      ]
     }
   },
   "scripts": {
     "build": "tsdown src/index.ts --format esm --dts --out-dir lib --no-clean",
-    "prepack": "node -e \"require('fs').rmSync('lib',{recursive:true,force:true})\" && pnpm build && pnpm build:client && node ../../scripts/prepare-package.mjs",
+    "prepack": "node -e \"require('fs').rmSync('lib',{recursive:true,force:true})\" && npm run build && npm run build:client && node ../../scripts/prepare-package.mjs",
     "typecheck": "tsc --noEmit",
     "test": "node --test \"test/*.test.ts\"",
     "build:client": "tsdown -c tsdown.client.config.ts"

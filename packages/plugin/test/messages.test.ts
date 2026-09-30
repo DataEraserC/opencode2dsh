@@ -1,3 +1,4 @@
+import { ensureResponsesFreeLaneShape } from '../src/adapter/messages.ts'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
@@ -350,4 +351,31 @@ test('ensureFreeLaneShape leaves satisfying and non-chat payloads untouched', ()
   assert.equal(ensureFreeLaneShape({ tools: [] }), undefined, 'no messages = not a chat body')
   assert.equal(ensureFreeLaneShape(null), undefined)
   assert.equal(ensureFreeLaneShape('text'), undefined)
+})
+test('assistant history preserves the Responses API for muse-spark models', async () => {
+  const context = await toPiContext(
+    options({
+      model: 'muse-spark-1.2-contributor-free',
+      messages: [
+        {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'previous response' }],
+          source: { kind: 'model', provider: 'opencode2dsh', model: 'muse-spark-1.2-contributor-free' },
+        },
+      ],
+    }),
+  )
+  const assistant = expectAssistant(context.messages[0])
+  assert.equal(assistant.api, 'openai-responses')
+})
+
+
+test('Responses free-lane bodies carry flat gate tools and supported tool choice', () => {
+  const body = { input: [{ role: 'user', content: 'ping' }], tools: [{ type: 'function', name: 'bash', parameters: {} }], tool_choice: 'none' }
+  const rewritten = ensureResponsesFreeLaneShape(body) as typeof body
+  assert.equal(rewritten.input, body.input)
+  assert.deepEqual(rewritten.tools.map((tool) => tool.name), ['bash', 'read'])
+  assert.equal(rewritten.tool_choice, 'auto')
+  assert.equal(ensureResponsesFreeLaneShape(rewritten), undefined)
+  assert.equal(ensureResponsesFreeLaneShape({ messages: [] }), undefined)
 })

@@ -1,38 +1,19 @@
 # Changelog
 
-## Unreleased
-
-### Added
-
-- **图片输入：DSH 中附加的图片现在会随对话发给模型（需模型具备视觉能力）。**
-  此前适配器三处能力声明均为 `['text']`，宿主 dsh-llm 在派发前把图片块投影成
-  文本占位符（`projectImagesForTextModel`），模型永远看不到图片内容。现在
-  `toPiModel` / `listModels` / `resolveModel` 按 `isVisionModel()` 条件声明：
-  已实测的视觉家族（mimo-v2.6，2026-09-28 在 DSH 0.1.7-rc.2 上完成整轮
-  图片往返）声明 `['text', 'image']`，其余模型保持 `['text']`——避免把
-  `image_url` 转发给看不了图的模型；需要时可在 DSH 模型设置里手动勾选
-  图片输入覆盖。`toPiContext` 改为异步：用户消息与工具结果里的图片块按
-  内容寻址从 harness 附件存储（`DSH_HOME/attachments/v1/objects/<sha 前 2 位>/<sha>`）
-  读出字节，转成 pi-ai image 块交由 pi-ai 序列化为 `image_url` data URL
-  （匿名 Zen 通道网关接受该形态，已实测 2026-09-23）。宿主按请求预算
-  剔除的图片（`offloaded: true`）不会被重新读回（尊重宿主已执行的
-  `projectOffloadedImages` 预算），降级为稳定占位符；附件不可读时同样
-  降级为稳定的文本占位（`[image omitted: ...]`，不会中断整条流）；助手
-  历史中的图片块不可回放，直接丢弃（原先抛错会中断历史重放）。纯文本
-  对话的行为与旧版完全一致。
-  > 注意：本 PR 的功能在 DSH 0.1.7 上需要插件**先能激活**（settingsScope
-  > 移除 + cordis 严格代理的激活修复，见 #23/#25 及后续激活 PR），否则
-  > client fiber `pending`/`failed` 会触发宿主 recovery 卸载整个插件。
-## 0.3.4 (2026-09-19)
+## 0.3.5 (2026-09-30)
 
 ### Fixed
 
-- **DSH 0.1.7-alpha.1 及以后插件不再卡在「不激活」。** 新版 DSH 移除了客户端的
-  `settingsScope` 服务，而插件仍把它列为启动依赖，于是网页端一直报
-  `pending (waiting for service: settingsScope)`，插件整体挂起、设置页卡片
-  看不到（用户反馈 issue #20）。现在改为向设置域提供的 `configForms` 服务索取
-  本插件自己的 namespace 表单，注入令牌与代码同步更新。IP 池设置卡片的读写、
-  保存与重置行为不变。
+- Restore startup on DSH 0.1.7 and 0.2: the client no longer gates on the removed `settingsScope`; the host requires only `llm`. The server entry returns a valid Cordis effect.
+- IP-pool configuration uses the served entry form on 0.1.7 and the installed plugin row on 0.2. Saves respect read-only forms, clear overrides when restoring inherited values, preserve older subscription URLs, and apply live. Late pool startup is disposed correctly on unload.
+- Muse Spark 1.3 uses Responses for requests and history. Reasoning choices use the nested payload; default requests omit unsupported `none`/`off`. Responses free-lane gate tools use the flat function format and supported `auto` choice.
+- Add the missing `imageRequestPricing` method used by `/compact`.
+- Read each model's context and output limits from models.dev, using the declared output budget instead of an extra 32768 ceiling. Invalid or missing limits retain the fallback.
+- Windows agent shutdown handles `taskkill` failures and observes exit before starting shutdown. Tests use portable subscription fixtures.
+
+### Added
+
+- Image input for the verified MiMo v2.6 family. User/tool-result attachments are loaded from the harness store; offloaded images stay offloaded, missing files produce placeholders, and text-only models keep their existing capabilities.
 
 ## 0.3.3 (2026-09-18)
 

@@ -5,7 +5,9 @@ import * as openaiResponses from '@earendil-works/pi-ai/api/openai-responses'
 import { ModelCatalog, ZEN_BASE_URL } from './catalog.ts'
 import { toStreamChunks, type HarnessChunk, type PiEvent } from './events.ts'
 import { deriveRequestIDs, disguiseHeaders } from './ids.ts'
-import { ensureFreeLaneShape, toPiContext, type HarnessGenerateOptions, type PiContext } from './messages.ts'
+import { ensureFreeLaneShape, ensureResponsesFreeLaneShape, toPiContext, type HarnessGenerateOptions, type PiContext } from './messages.ts'
+import { apiForModel, isResponsesModel } from './routing.ts'
+export { apiForModel, isResponsesModel } from './routing.ts'
 import { routingContext, type RoutingContext } from '../pool/dispatcher.ts'
 import { classifyStreamFailure, isRegionBlocked, shouldRotate } from '../pool/rotate.ts'
 
@@ -45,20 +47,20 @@ const DEFAULT_MAX_TOKENS = 32768
  * metadata speaks, the host default otherwise (pending/absent metadata or a
  * model that declares no `limit.context`). */
 function contextWindowFor(limits: { contextWindow?: number } | undefined): number {
-  return limits?.contextWindow !== undefined && limits.contextWindow > 0
-    ? limits.contextWindow
+  const declared = limits?.contextWindow
+  return typeof declared === 'number' && Number.isSafeInteger(declared) && declared > 0
+    ? declared
     : DEFAULT_CONTEXT_WINDOW
 }
 
 /**
- * The default output cap: only ever LOWERED by a declared `limit.output`
- * (never raised) — asking upstream for more tokens than the model allows is
- * a hard 400, while the conservative host default stays untouched whenever
- * the model allows at least that much (or the metadata cannot speak).
+ * Use the declared output budget, including models that can answer beyond
+ * 32768 tokens. Keep the fallback when metadata cannot provide a valid cap.
  */
 function defaultMaxTokensFor(limits: { maxOutput?: number } | undefined): number {
-  return limits?.maxOutput !== undefined && limits.maxOutput > 0
-    ? Math.min(DEFAULT_MAX_TOKENS, limits.maxOutput)
+  const declared = limits?.maxOutput
+  return typeof declared === 'number' && Number.isSafeInteger(declared) && declared > 0
+    ? declared
     : DEFAULT_MAX_TOKENS
 }
 
@@ -168,9 +170,7 @@ function terminalErrorEvent(errorMessage: string, model: Model<Api>): PiEvent {
  * (opencode #44659/#44847, DSH #3957). Route by model id; extend this list
  * if Zen moves more models (candidates: gpt-5.6-luna, grok-4.6).
  */
-export function isResponsesModel(id: string): boolean {
-  return String(id ?? '').toLowerCase().startsWith('muse-spark')
-}
+
 
 /**
  * Vision gate: ids whose image input is verified end-to-end on the Zen lane
@@ -190,7 +190,7 @@ function toPiModel(id: string, reasoning: boolean, limits?: { contextWindow?: nu
   return {
     id,
     name: id,
-    api: isResponses ? 'openai-responses' : 'openai-completions',
+    api: apiForModel(id),
     provider: PROVIDER_ID,
     baseUrl: `${ZEN_BASE_URL.replace(/\/+$/, '')}/v1`,
     // The honest capability flag: gates pi-ai's reasoning_effort branch and
@@ -207,6 +207,36 @@ function toPiModel(id: string, reasoning: boolean, limits?: { contextWindow?: nu
     contextWindow: contextWindowFor(limits),
     maxTokens: defaultMaxTokensFor(limits),
   }
+}
+
+function normalizeResponsesEffort(value: string | undefined): string | undefined {
+  if (!value || value === 'off' || value === 'none') return undefined
+  return (REASONING_EFFORT_LADDER as readonly string[]).includes(value) ? value : undefined
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/** Normalize pi-ai's mixed reasoning shapes before a Responses request. */
+export function normalizeResponsesPayload(payload: unknown, requestedEffort?: string): unknown | undefined {
+  const shaped = ensureFreeLaneShape(payload)
+  const base = shaped ?? payload
+  if (!isRecord(base)) return shaped
+
+  const next = { ...base }
+  const legacyEffort = typeof next.reasoning_effort === 'string' ? next.reasoning_effort : undefined
+  delete next.reasoning_effort
+
+  const reasoning = isRecord(next.reasoning) ? { ...next.reasoning } : {}
+  const existingEffort = normalizeResponsesEffort(typeof reasoning.effort === 'string' ? reasoning.effort : undefined)
+  const effort = normalizeResponsesEffort(requestedEffort) ?? existingEffort ?? normalizeResponsesEffort(legacyEffort)
+  if (effort) reasoning.effort = effort
+  else delete reasoning.effort
+
+  if (Object.keys(reasoning).length > 0) next.reasoning = reasoning
+  else delete next.reasoning
+  return next
 }
 
 export class ZenAdapter {
@@ -308,7 +338,8 @@ export class ZenAdapter {
     }
     // The thinking-level picker: dsh-llm validates every selected id against
     // this list and echoes the choice back on GenerateOptions.reasoningEffort.
-    const efforts = reasoningEfforts(this.#catalog.reasoningCapability(model))
+    const declaredEfforts = reasoningEfforts(this.#catalog.reasoningCapability(model))
+    const efforts = isResponsesModel(model) ? declaredEfforts?.filter((effort) => effort.id !== 'off') : declaredEfforts
     if (efforts) resolved.reasoning = { efforts }
     return resolved
   }
@@ -521,15 +552,28 @@ export class ZenAdapter {
     model: ReturnType<typeof toPiModel>,
   ): unknown {
     // Structural boundary: PiContext (own types, unit-tested) -> pi-ai Context.
+    const isResponses = model.api === 'openai-responses'
+    const requestedReasoning = typeof options.reasoningEffort === 'string'
+      ? options.reasoningEffort
+      : typeof options.reasoning === 'string'
+        ? options.reasoning
+        : undefined
+    const responseReasoning = isResponses ? normalizeResponsesEffort(requestedReasoning) : undefined
+    const effortWire = isResponses ? undefined : reasoningEffortWire(options.reasoningEffort)
+
     // onPayload injects the free-lane gate tools (adapter/messages.ts) into the
     // serialized body right before dispatch — plain-chat contexts carry no
     // tools and the anonymous lane 403s every body without bash+read. The same
     // seam carries the selected reasoning effort: pi-ai has no option with the
     // wire semantics this lane needs (selected off must SEND `none`, not omit),
     // so the effort rides the payload rewrite instead.
-    const effortWire = reasoningEffortWire(options.reasoningEffort)
     const onPayload =
-      effortWire === undefined
+      isResponses
+        ? (payload: unknown): unknown => {
+            const normalized = normalizeResponsesPayload(payload, responseReasoning)
+            return ensureResponsesFreeLaneShape(normalized ?? payload) ?? normalized
+          }
+        : effortWire === undefined
         ? ensureFreeLaneShape
         : (payload: unknown): unknown => {
             const shaped = ensureFreeLaneShape(payload)
@@ -549,6 +593,7 @@ export class ZenAdapter {
       maxRetries: 0,
       temperature: options.temperature,
       maxTokens: options.maxTokens,
+      ...(responseReasoning ? { reasoning: responseReasoning } : {}),
     })
   }
 

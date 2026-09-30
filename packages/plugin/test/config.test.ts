@@ -1,3 +1,5 @@
+import { Config } from '../src/config.ts'
+import { resolveIpPoolSettings } from '../src/ip-pool-settings/namespace.ts'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
@@ -58,4 +60,10 @@ test('writeAgentConfig emits the design.md section 8.3 template', async () => {
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
+})
+
+test('Config preserves subscription URLs from an older profile patch', () => {
+  const config = Config({ ipPool: { subscriptions: ['https://example.test/sub'] } })
+  const value = resolveIpPoolSettings(JSON.parse(JSON.stringify(config.ipPool.get())))
+  assert.deepEqual(value.subscription.urls, ['https://example.test/sub'])
 })

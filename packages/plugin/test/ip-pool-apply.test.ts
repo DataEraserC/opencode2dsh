@@ -80,6 +80,47 @@ function makeVolatileHost(initial?: AnyIpPoolSection) {
 
 const tick = (ms = 30): Promise<void> => new Promise((r) => setTimeout(r, ms))
 
+test('edits during pool startup share one runtime and apply the latest value', async () => {
+  const host = makeVolatileHost({ enabled: true })
+  let release = (): void => {}
+  const gate = new Promise<void>((done) => { release = done })
+  let starts = 0
+  const applied: unknown[] = []
+  applyIpPoolSettings(host.ctx, ordinary(), () => host.ref.get(), host.ctx.logger, { assemble: async () => {
+    starts++
+    await gate
+    return { reconfigure: async (config: unknown) => { applied.push(config) }, dispose: async () => {} } as never
+  } })
+  host.commit({ enabled: true, manual: ['http://127.0.0.1:7897'] })
+  host.commit({ enabled: false })
+  release()
+  await tick()
+  assert.equal(starts, 1)
+  assert.ok(applied.length > 0)
+  for (const config of applied as Array<{ ipPool: { enabled: boolean; manual: string[] } }>) {
+    assert.equal(config.ipPool.enabled, false)
+    assert.deepEqual(config.ipPool.manual, ['http://127.0.0.1:7897'])
+  }
+})
+
+test('unloading while the pool starts disposes the late runtime', async () => {
+  const host = makeVolatileHost({ enabled: true })
+  const effects: Array<() => void> = []
+  host.ctx.effect = (fn) => { effects.push(fn()) }
+  let release = (): void => {}
+  const gate = new Promise<void>((done) => { release = done })
+  let disposed = false
+  const controller = applyIpPoolSettings(host.ctx, ordinary(), () => host.ref.get(), host.ctx.logger, { assemble: async () => {
+    await gate
+    return { reconfigure: async () => { assert.fail('a disposed plugin must not reconfigure') }, dispose: async () => { disposed = true } } as never
+  } })
+  for (const dispose of effects) dispose()
+  release()
+  await tick()
+  assert.equal(disposed, true)
+  assert.equal(controller.runtime, null)
+})
+
 test('the served namespace is the Loader entry id, not a hand-registered "ip-pool"', () => {
   assert.equal(IP_POOL_NAMESPACE, 'opencode2dsh')
 })

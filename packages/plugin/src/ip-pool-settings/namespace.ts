@@ -80,6 +80,8 @@ export const IpPoolConfigSchema = Schema.object({
   }),
   /** Manually added plain proxies: 'http://h:p' or 'socks5://h:p' (§1.2 source 2). */
   manual: Schema.array(Schema.string()).default([]),
+  /** Previous patch spelling; no default so nested settings can take over. */
+  subscriptions: Schema.array(Schema.string()),
   subscription: Schema.object({
     /** Airport/self-hosted subscription URLs (display-redacted client-side, §5.1). */
     urls: Schema.array(Schema.string()).default([]),
@@ -157,7 +159,7 @@ export interface AnyIpPoolSection {
  */
 export function resolveIpPoolSettings(value: AnyIpPoolSection | undefined): IpPoolSettings {
   const raw = value ?? {}
-  const urls = raw.subscription?.urls ?? raw.subscriptions ?? []
+  const urls = raw.subscriptions ?? raw.subscription?.urls ?? []
   return {
     enabled: raw.enabled ?? false,
     probeModels: raw.probeModels ?? [],

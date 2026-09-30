@@ -57,11 +57,10 @@ const ORDER = 20
 /**
  * Required services (cordis fiber inject).
  *
- * `configForms` carries `whileServed`, the 0.1.7 way to mount a page only while
- * the Host serves its namespace. `settingsScope` and the old
- * `settings.plugin.item` slot are gone.
+ * Only stable services gate the main fiber. configForms is requested in a
+ * separate fiber and owns the settings contribution's served lifetime.
  */
-export const inject = ['slots', 'locale', 'configForms']
+export const inject = ['slots', 'locale']
 
 /**
  * Mount the IP 池 page whenever the Host serves this entry's settings.
@@ -70,17 +69,39 @@ export const inject = ['slots', 'locale', 'configForms']
 export function apply(ctx: ClientContext): void {
   const t = ctx.locale.bind(NS)
   ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'opencode2dsh: copy dictionaries')
-  ctx.effect(
-    () => ctx.configForms.whileServed(
+  const slots = ctx.slots as unknown as {
+    inject(name: string, callback: () => () => void): () => void
+    spec(name: string): unknown
+    register(options: Record<string, unknown>, component: unknown): () => void
+  }
+  // Request the version-specific service in its own fiber, so an older host
+  // without configForms can still activate this plugin and its provider.
+  ctx.inject(['configForms'], (formCtx) => { formCtx.effect(
+    () => formCtx.configForms.whileServed(
       [SETTINGS_NAMESPACE],
-      () => ctx.slots.inject('plugins.item', () => ctx.slots.register({
-        name: 'plugins.item',
-        id: SETTINGS_NAMESPACE,
-        order: ORDER,
-        label: () => t('title'),
-        locale: NS,
-      }, IpPoolCard)),
+      () => {
+        // 0.2 mounts configuration inside each installed bundle's row.
+        const row = slots.inject('plugins.row.config', () => {
+          const disposers = ['@opencode2dsh/dsh-plugin', 'opencode2dsh'].map((pkg) => slots.register({
+            name: 'plugins.row.config',
+            key: `${pkg}#${SETTINGS_NAMESPACE}`,
+            locale: NS,
+          }, IpPoolCard))
+          return () => { for (const dispose of disposers) dispose() }
+        })
+        const legacy = slots.inject('plugins.item', () => {
+          if (slots.spec('plugins.row.config') !== undefined) return () => {}
+          return slots.register({
+            name: 'plugins.item',
+            id: SETTINGS_NAMESPACE,
+            order: ORDER,
+            label: () => t('title'),
+            locale: NS,
+          }, IpPoolCard)
+        })
+        return () => { row(); legacy() }
+      },
     ),
     'opencode2dsh: settings page',
-  )
+  ) })
 }

@@ -62,7 +62,7 @@ test('client reads and writes settings through the page-supplied ConfigPageForm'
   assert.ok(source.includes('.mutate('), 'writes through mutate(ops, revision)')
   // The served value is the whole entry: the editable section is the `ipPool`
   // volatile node, so every write path keeps that field in front.
-  assert.ok(/\[\s*IP_POOL_FIELD\s*,\s*write\.field\s*\]/.test(source), 'write paths nest under the ipPool field')
+  assert.ok(/\[\s*"ipPool"\s*,\s*write\.field\s*\]/.test(source), 'write paths nest under the ipPool field')
   assert.ok(/\[\s*IP_POOL_FIELD\s*,\s*"pinnedExitId"\s*\]/.test(source), 'pinned-exit write nests under ipPool too')
   // The save control belongs to the shared form chrome, not this page.
   assert.ok(source.includes('SettingsForm'), 'the page renders inside the shared form chrome')
@@ -110,6 +110,7 @@ test('client manifest is declared in package.json', () => {
   assert.ok(!pkg.dsh.client.inject.some((e: string) => e.includes('settingsScope')), 'the service DSH removed is not requested')
 
   const entry = readFileSync(new URL('../src/client/index.ts', import.meta.url), 'utf8')
-  assert.match(entry, /export const inject = \['slots', 'locale', 'configForms'\]/, 'the client entry injects services')
+  assert.match(entry, /export const inject = \['slots', 'locale'\]/, 'only stable services gate the main client fiber')
+  assert.ok(bundle().includes('plugins.row.config'), 'the DSH 0.2 row configuration is registered')
   assert.deepEqual(pkg.exports?.['./client'], './lib/client.js')
 })
