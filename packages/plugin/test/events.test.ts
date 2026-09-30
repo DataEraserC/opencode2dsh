@@ -125,6 +125,25 @@ test('zero-cache usage omits the optional keys', async () => {
   assert.deepEqual(chunks[0], { type: 'usage', usage: { inputTokens: 10, outputTokens: 5 } })
 })
 
+test('Muse regional 403 keeps its upstream explanation in both error event shapes', async () => {
+  const message = 'OpenAI API error (403): {"type":"RegionError","message":"This model is not available in your country."}'
+  const completed = event({ stopReason: 'error', errorMessage: message })
+  assert.equal(completed.type, 'done')
+  if (completed.type !== 'done') assert.fail('expected a done event')
+  for (const upstream of [completed, { type: 'error', error: completed.message } as PiEvent]) {
+    const chunks = await collect([upstream])
+    assert.deepEqual(failureOf(expectFinish(chunks[1])), { message, code: 'REGION_BLOCKED' })
+  }
+})
+
+test('authentication failures retain AUTH when the upstream does not report a region block', async () => {
+  for (const status of [401, 403]) {
+    const message = `OpenAI API error (${status}): {"error":{"code":"invalid_api_key","message":"Invalid API key"}}`
+    const chunks = await collect([event({ stopReason: 'error', errorMessage: message })])
+    assert.deepEqual(failureOf(expectFinish(chunks[1])), { message, code: 'AUTH' })
+  }
+})
+
 test('an empty completed response is an EMPTY_RESPONSE error', async () => {
   const chunks = await collect([event({ content: [] })])
   const failure = failureOf(expectFinish(chunks[1]))
