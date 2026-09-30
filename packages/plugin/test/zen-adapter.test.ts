@@ -35,6 +35,39 @@ test('resolveModel declares text-only input and finite limits', () => {
   assert.equal(resolved.id, 'big-pickle')
 })
 
+test('resolveModel prefers models.dev limits and keeps the defaults without them', () => {
+  const catalog = (limits?: { contextWindow?: number; maxOutput?: number }) => ({
+    list: () => ['big-pickle', 'ghost'],
+    decision: () => ({ allowed: true, source: 'test', known: true }),
+    reasoningCapability: () => undefined,
+    limits: (model: string) => (model === 'big-pickle' ? limits : undefined),
+  })
+  // declared window wins over the flat host default
+  const windowed = new ZenAdapter(catalog({ contextWindow: 131072, maxOutput: 16384 }))
+  assert.equal(windowed.resolveModel('opencode2dsh', 'big-pickle').context.contextWindow, 131072)
+  assert.equal(windowed.resolveModel('opencode2dsh', 'big-pickle').defaultMaxTokens, 16384)
+
+  // a declared output cap only LOWERS the default (never raises it)
+  const capped = new ZenAdapter(catalog({ maxOutput: 4096 }))
+  assert.equal(capped.resolveModel('opencode2dsh', 'big-pickle').defaultMaxTokens, 4096)
+  const roomy = new ZenAdapter(catalog({ contextWindow: 1048576, maxOutput: 384000 }))
+  assert.equal(roomy.resolveModel('opencode2dsh', 'big-pickle').context.contextWindow, 1048576)
+  assert.equal(roomy.resolveModel('opencode2dsh', 'big-pickle').defaultMaxTokens, 32768)
+
+  // metadata cannot speak: flat defaults, exactly as before the fix
+  const plain = new ZenAdapter(catalog())
+  assert.equal(plain.resolveModel('opencode2dsh', 'ghost').context.contextWindow, 262144)
+  assert.equal(plain.resolveModel('opencode2dsh', 'ghost').defaultMaxTokens, 32768)
+
+  // a catalog without a limits() member at all (structural CatalogLike)
+  const legacy = new ZenAdapter({
+    list: () => ['big-pickle'],
+    decision: () => ({ allowed: true, source: 'test', known: true }),
+    reasoningCapability: () => undefined,
+  })
+  assert.equal(legacy.resolveModel('opencode2dsh', 'big-pickle').context.contextWindow, 262144)
+})
+
 test('prepareCall returns the resolved model and a stream dispatcher', async () => {
   const adapter = new ZenAdapter(new ModelCatalog())
   const call = await adapter.prepareCall('opencode2dsh', 'big-pickle')
@@ -172,6 +205,31 @@ test('stream keeps the free-lane gate rewrite alongside the effort injection', a
   assert.equal(offOptions.onPayload?.(null), undefined)
 })
 
+test('stream builds the pi-ai wire model with the catalog limits', async () => {
+  let seen: { contextWindow?: number; maxTokens?: number } | undefined
+  const provider = {
+    streamSimple(model: { contextWindow?: number; maxTokens?: number }, _context: unknown, _options: unknown): AsyncIterable<{ type: string }> {
+      seen = model
+      return (async function* () {
+        yield { type: 'start' }
+        yield { type: 'done', message: { stopReason: 'stop', content: [], usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2 } } }
+      })()
+    },
+  }
+  const adapter = new ZenAdapter(
+    {
+      list: () => ['big-pickle'],
+      decision: () => ({ allowed: true, source: 'test', known: true }),
+      reasoningCapability: () => undefined,
+      limits: () => ({ contextWindow: 65536, maxOutput: 8192 }),
+    },
+    { providerOverride: provider },
+  )
+  for await (const chunk of adapter.stream({ provider: 'opencode2dsh', model: 'big-pickle', messages: [] })) void chunk
+  assert.equal(seen?.contextWindow, 65536)
+  assert.equal(seen?.maxTokens, 8192)
+})
+
 test('isResponsesModel routes muse-spark to responses, everything else to chat', () => {
   for (const id of ['muse-spark-1.3-contributor-free', 'muse-spark-1.2-contributor-free', 'muse-spark-1.2', 'MUSE-SPARK-1.3']) {
     assert.equal(isResponsesModel(id), true, id)
@@ -196,7 +254,7 @@ test('responses models use the wider body-idle window, injectable for tests', as
   }
   const measure = async (model: string) => {
     const adapter = new ZenAdapter(
-      { list: () => [], decision: () => ({ allowed: true, source: 'test', known: true }) },
+      { list: () => [], decision: () => ({ allowed: true, source: 'test', known: true }), reasoningCapability: () => undefined },
       { providerOverride: { streamSimple: () => hangAfterStart() }, firstEventMs: 50, bodyIdleMs: 50, responsesBodyIdleMs: 400 },
     )
     const began = Date.now()

@@ -34,10 +34,33 @@ export interface CatalogLike {
   list(): string[]
   decision(model: string): { allowed: boolean; source: string; known: boolean }
   reasoningCapability(model: string): { reasoning: boolean; effortValues: string[] } | undefined
+  /** Optional: models.dev-declared limits; absent catalogs keep the defaults. */
+  limits?(model: string): { contextWindow?: number; maxOutput?: number } | undefined
 }
 
 const DEFAULT_CONTEXT_WINDOW = 262144
 const DEFAULT_MAX_TOKENS = 32768
+
+/** The advertised context window: the models.dev declaration when the
+ * metadata speaks, the host default otherwise (pending/absent metadata or a
+ * model that declares no `limit.context`). */
+function contextWindowFor(limits: { contextWindow?: number } | undefined): number {
+  return limits?.contextWindow !== undefined && limits.contextWindow > 0
+    ? limits.contextWindow
+    : DEFAULT_CONTEXT_WINDOW
+}
+
+/**
+ * The default output cap: only ever LOWERED by a declared `limit.output`
+ * (never raised) — asking upstream for more tokens than the model allows is
+ * a hard 400, while the conservative host default stays untouched whenever
+ * the model allows at least that much (or the metadata cannot speak).
+ */
+function defaultMaxTokensFor(limits: { maxOutput?: number } | undefined): number {
+  return limits?.maxOutput !== undefined && limits.maxOutput > 0
+    ? Math.min(DEFAULT_MAX_TOKENS, limits.maxOutput)
+    : DEFAULT_MAX_TOKENS
+}
 
 /**
  * Reasoning-effort vocabulary the adapter owns end to end (dsh-llm treats the
@@ -149,7 +172,7 @@ export function isResponsesModel(id: string): boolean {
   return String(id ?? '').toLowerCase().startsWith('muse-spark')
 }
 
-function toPiModel(id: string, reasoning: boolean): Model<Api> {
+function toPiModel(id: string, reasoning: boolean, limits?: { contextWindow?: number; maxOutput?: number }): Model<Api> {
   const isResponses = isResponsesModel(id)
   return {
     id,
@@ -164,8 +187,8 @@ function toPiModel(id: string, reasoning: boolean): Model<Api> {
     reasoning,
     input: ['text'],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: DEFAULT_CONTEXT_WINDOW,
-    maxTokens: DEFAULT_MAX_TOKENS,
+    contextWindow: contextWindowFor(limits),
+    maxTokens: defaultMaxTokensFor(limits),
   }
 }
 
@@ -263,8 +286,8 @@ export class ZenAdapter {
       id: model,
       name: model,
       inputModalities: ['text'],
-      context: { contextWindow: DEFAULT_CONTEXT_WINDOW },
-      defaultMaxTokens: DEFAULT_MAX_TOKENS,
+      context: { contextWindow: contextWindowFor(this.#catalog.limits?.(model)) },
+      defaultMaxTokens: defaultMaxTokensFor(this.#catalog.limits?.(model)),
     }
     // The thinking-level picker: dsh-llm validates every selected id against
     // this list and echoes the choice back on GenerateOptions.reasoningEffort.
@@ -296,7 +319,7 @@ export class ZenAdapter {
   async *stream(options: HarnessGenerateOptions): AsyncGenerator<HarnessChunk> {
     const context = toPiContext(options)
     const ids = deriveRequestIDs(options.messages)
-    const model = toPiModel(options.model, this.#catalog.reasoningCapability(options.model)?.reasoning === true)
+    const model = toPiModel(options.model, this.#catalog.reasoningCapability(options.model)?.reasoning === true, this.#catalog.limits?.(options.model))
     // IP-pool routing context (docs/ip-pool.md 3.3): pi-ai builds the request
     // body and dispatches it on separate layers with no channel for "which
     // model is this fetch for", so the per-request context rides AsyncLocalStorage.
