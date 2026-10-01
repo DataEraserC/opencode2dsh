@@ -67,3 +67,37 @@ test('Config preserves subscription URLs from an older profile patch', () => {
   const value = resolveIpPoolSettings(JSON.parse(JSON.stringify(config.ipPool.get())))
   assert.deepEqual(value.subscription.urls, ['https://example.test/sub'])
 })
+
+test('Config keeps nested subscription URLs through schema resolution', () => {
+  // Schemastery auto-defaults the legacy flat `subscriptions` array to []
+  // during resolution; that empty array must not shadow the nested URLs —
+  // the settings card writes the nested spelling (and unsets the flat one).
+  const config = Config({ ipPool: { subscription: { urls: ['https://nested.test/sub'] } } })
+  const resolved = JSON.parse(JSON.stringify(config.ipPool.get())) as Record<string, unknown>
+  const value = resolveIpPoolSettings(resolved)
+  assert.deepEqual(value.subscription.urls, ['https://nested.test/sub'])
+})
+
+test('Config keeps nested URLs when a legacy flat key also resolves to empty', () => {
+  const config = Config({
+    ipPool: { subscriptions: [], subscription: { urls: ['https://nested.test/a', 'https://nested.test/b'] } },
+  })
+  const value = resolveIpPoolSettings(JSON.parse(JSON.stringify(config.ipPool.get())))
+  assert.deepEqual(value.subscription.urls, ['https://nested.test/a', 'https://nested.test/b'])
+})
+
+test('Config resolves an explicitly cleared pool to no URLs', () => {
+  const config = Config({ ipPool: { subscriptions: [], subscription: { urls: [] } } })
+  const value = resolveIpPoolSettings(JSON.parse(JSON.stringify(config.ipPool.get())))
+  assert.deepEqual(value.subscription.urls, [])
+})
+
+test('Config prefers the nested spelling when both spellings carry URLs', () => {
+  // The settings card writes nested and unsets the flat key, so a stale flat
+  // list must not win over the nested one.
+  const config = Config({
+    ipPool: { subscriptions: ['https://stale.test/old'], subscription: { urls: ['https://current.test/new'] } },
+  })
+  const value = resolveIpPoolSettings(JSON.parse(JSON.stringify(config.ipPool.get())))
+  assert.deepEqual(value.subscription.urls, ['https://current.test/new'])
+})

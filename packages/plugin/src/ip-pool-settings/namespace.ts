@@ -80,7 +80,12 @@ export const IpPoolConfigSchema = Schema.object({
   }),
   /** Manually added plain proxies: 'http://h:p' or 'socks5://h:p' (§1.2 source 2). */
   manual: Schema.array(Schema.string()).default([]),
-  /** Previous patch spelling; no default so nested settings can take over. */
+  /**
+   * Previous patch spelling, kept for older profile patches. NOTE: schemastery
+   * auto-assigns `default: []` to every array schema even without
+   * `.default()`, so a resolved value always carries this key — an empty []
+   * here must NOT shadow `subscription.urls` (see resolveIpPoolSettings).
+   */
   subscriptions: Schema.array(Schema.string()),
   subscription: Schema.object({
     /** Airport/self-hosted subscription URLs (display-redacted client-side, §5.1). */
@@ -163,7 +168,13 @@ export interface AnyIpPoolSection {
  */
 export function resolveIpPoolSettings(value: AnyIpPoolSection | undefined): IpPoolSettings {
   const raw = value ?? {}
-  const urls = raw.subscriptions ?? raw.subscription?.urls ?? []
+  // Schemastery auto-assigns `default: []` to EVERY array schema (it does not
+  // require `.default()`), so schema resolution always materializes the legacy
+  // flat key — an empty `[]` is not nullish and would shadow the nested URLs
+  // under `??`. Prefer a non-empty `subscription.urls` (the spelling the
+  // settings card writes) and fall back to the flat list only as the legacy
+  // profile-patch spelling; a truly cleared pool keeps [] on both.
+  const urls = raw.subscription?.urls?.length ? raw.subscription.urls : (raw.subscriptions ?? [])
   return {
     enabled: raw.enabled ?? false,
     probeModels: raw.probeModels ?? [],
