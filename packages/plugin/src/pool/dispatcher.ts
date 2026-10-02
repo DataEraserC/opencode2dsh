@@ -197,9 +197,16 @@ export class PoolRoutingDispatcher implements RoutingDispatcherSurface {
   constructor(options: PoolRoutingOptions) {
     this.#pool = options.pool
     this.#undici = options.undici
-    this.#proxyHosts = new Set(
-      (options.proxyHosts ?? DEFAULT_PROXY_HOSTS).map((host) => normalizeHost(host)),
-    )
+    // Empty array must behave like unset: `??` only catches undefined, and
+    // the settings schema resolves ipPool.proxyHosts to [] whenever the
+    // profile leaves it out (live-observed 2026-10-02: a `new Set([])`
+    // fails .has() for EVERY host and silently routed all zen traffic
+    // direct — 429 on one Clash exit IP while the pool looked green).
+    // Same guard as setProxyHosts below.
+    this.#proxyHosts =
+      options.proxyHosts && options.proxyHosts.length > 0
+        ? new Set(options.proxyHosts.map((host) => normalizeHost(host)))
+        : new Set(DEFAULT_PROXY_HOSTS.map((host) => normalizeHost(host)))
     this.#agentLruCap = options.agentLruCap ?? 16
     this.#sentinelMs = options.sentinelMs ?? 2_000
     this.#headersMs = options.headersMs ?? 10_000

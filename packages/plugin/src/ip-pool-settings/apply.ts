@@ -150,12 +150,21 @@ export function applyIpPoolSettings(
       if (!bctx.webServer) return
       const handlers = makeBridgeHandlers(
         () => controller.runtime,
-        () => ({
-          pinnedStrict: controller.settings().pinnedStrict,
-          proxyHosts: controller.runtime?.installer && controller.settings().proxyHosts.length > 0
-            ? controller.settings().proxyHosts
-            : ['opencode.ai'],
-        }),
+        () => {
+          // Prefer the RUNNING router's set: settings and the constructed
+          // Set can diverge (live-observed 2026-10-02 — an empty config
+          // array passed `?? DEFAULT`, the card showed ['opencode.ai'],
+          // and every host actually routed direct).
+          const live = controller.runtime?.installer?.proxyHosts
+          return {
+            pinnedStrict: controller.settings().pinnedStrict,
+            proxyHosts: live
+              ? [...live]
+              : controller.settings().proxyHosts.length > 0
+                ? controller.settings().proxyHosts
+                : ['opencode.ai'],
+          }
+        },
         {
           // Probe-model dropdown rows: the plugin's live Zen catalog when one
           // is running (adapter mode), static S3 list only otherwise.

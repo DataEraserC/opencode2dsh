@@ -62,6 +62,15 @@ export class RoutingInstaller {
     return this.#deferredReason
   }
 
+  /** The LIVE router's proxied-host set (status bridge truth while
+   *  installed): settings and the constructed Set can diverge — an empty
+   *  config array used to slip past `?? DEFAULT` and route everything
+   *  direct while the card still showed ['opencode.ai']. Undefined while
+   *  no router is installed (routing off). */
+  get proxyHosts(): readonly string[] | undefined {
+    return this.#current?.proxyHosts
+  }
+
   /** Live re-apply of the proxied-host list (forwards to the running router). */
   setProxyHosts(hosts?: string[]): void {
     this.#deps.proxyHosts = hosts

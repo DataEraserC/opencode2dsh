@@ -108,6 +108,9 @@ export interface IpPoolRuntime {
     readonly enabled: boolean
     /** R1 coexistence: why the routing layer deferred (null when active). */
     readonly deferredReason: string | null
+    /** The live router's host allowlist while installed (status truth;
+     *  undefined while routing is off). */
+    readonly proxyHosts?: readonly string[]
   }
   /** Shared probe scheduler (admission + periodic probes + UI-triggered). */
   prober: Prober

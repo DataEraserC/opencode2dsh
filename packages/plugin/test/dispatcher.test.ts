@@ -144,6 +144,47 @@ test('dispatcher: empty/unusable pool falls back to direct, never fails closed',
   assert.deepEqual(hops, ['direct'])
 })
 
+test('dispatcher: empty/absent proxyHosts config falls back to the default allowlist — never routes every host direct', () => {
+  // Regression 2026-10-02: the settings schema resolves ipPool.proxyHosts to
+  // [] when the profile leaves it unset; the constructor's `?? DEFAULT`
+  // kept that empty array, `new Set([]).has(host)` failed for EVERY host,
+  // and all zen traffic went direct (429 on one Clash exit IP) while the
+  // pool and status card both looked healthy.
+  const pool = new ExitPool()
+  pool.add(node({ id: 'p:1', exitIP: '1.1.1.1', latencyMs: 10 }))
+  pool.markOk('p:1')
+
+  const { seam, hops } = fakeSeam()
+  const empty = new PoolRoutingDispatcher({ pool, undici: seam as never, proxyHosts: [] })
+  assert.deepEqual([...empty.proxyHosts], ['opencode.ai'], 'empty config still exposes the default host')
+  routingContext.run({ model: 'm', session: 's' }, () => {
+    empty.dispatch({ origin: 'https://opencode.ai/x' } as never, {} as never)
+  })
+  assert.match(hops[0]!, /^proxy:/, 'empty config must route the default host through the pool')
+
+  const absent = new PoolRoutingDispatcher({ pool, undici: seam as never })
+  assert.deepEqual([...absent.proxyHosts], ['opencode.ai'], 'absent config defaults the same way')
+})
+
+test('installer: status proxyHosts reads the LIVE router — empty config surfaces the default list', () => {
+  const pool = new ExitPool()
+  pool.add(node({ id: 'p:1' }))
+  pool.markOk('p:1')
+  const { seam } = fakeSeam()
+  const installer = new RoutingInstaller({
+    pool,
+    undici: seam as never,
+    proxyHosts: [], // exactly what schema-resolved settings hand over
+    logger: { info: () => {}, warn: () => {} },
+  })
+  assert.equal(installer.proxyHosts, undefined, 'no router yet — no runtime claim')
+  installer.install()
+  assert.ok(installer.enabled)
+  assert.deepEqual([...installer.proxyHosts!], ['opencode.ai'], 'live set, not the [] config')
+  installer.disable()
+  assert.equal(installer.proxyHosts, undefined, 'routing off — no live set')
+})
+
 test('installer: install/disable swaps the global dispatcher and restores the previous one', () => {
   const pool = new ExitPool()
   pool.add(node({ id: 'p:1' }))
