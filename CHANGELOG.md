@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.6 (2026-10-01)
+
+### Fixed
+
+- Retry a reasoning-only output-limit response once with thinking Off on models that expose Off. Keep streamed reasoning, sum both requests' usage, and assign fresh block indices. Responses that emitted text or any tool call, upstream failures, cancelled requests, and models without Off are not replayed.
+
 ## 0.3.5 (2026-09-30)
 
 ### Fixed

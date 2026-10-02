@@ -3,7 +3,7 @@ import * as openaiCompletions from '@earendil-works/pi-ai/api/openai-completions
 import * as openaiResponses from '@earendil-works/pi-ai/api/openai-responses'
 
 import { ModelCatalog, ZEN_BASE_URL } from './catalog.ts'
-import { toStreamChunks, type HarnessChunk, type PiEvent } from './events.ts'
+import { toStreamChunks, type HarnessChunk, type PiDoneMessage, type PiEvent } from './events.ts'
 import { deriveRequestIDs, disguiseHeaders } from './ids.ts'
 import { ensureFreeLaneShape, ensureResponsesFreeLaneShape, toPiContext, type HarnessGenerateOptions, type PiContext } from './messages.ts'
 import { apiForModel, isResponsesModel } from './routing.ts'
@@ -354,7 +354,80 @@ export class ZenAdapter {
     }
   }
 
-  /** Stream one Chat turn from the Zen anonymous lane.
+  /**
+   * Recover once from a reasoning-only output limit on models that offer Off.
+   * Keep the first attempt's reasoning visible, but withhold its terminal
+   * chunks until recovery finishes. Answer/tool events forbid replay; retry
+   * blocks get fresh indices and the final usage includes both requests.
+   */
+  async *stream(options: HarnessGenerateOptions): AsyncGenerator<HarnessChunk> {
+    const selectedEffort = options.reasoningEffort ?? options.reasoning
+    const canDisableThinking = selectedEffort !== 'off' && selectedEffort !== 'none'
+      && this.resolveModel(options.provider, options.model).reasoning?.efforts.some((effort) => effort.id === 'off') === true
+    let request = options
+    let indexOffset = 0
+    let nextIndex = 0
+    let priorUsage: Extract<HarnessChunk, { type: 'usage' }>['usage'] | undefined
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      let sawReasoning = false
+      let sawAnswerOrTool = false
+      let usage: Extract<HarnessChunk, { type: 'usage' }> | undefined
+      let finish: Extract<HarnessChunk, { type: 'finish' }> | undefined
+
+      for await (const chunk of this.#streamAttempt(request, (message) => {
+        for (const block of message.content) {
+          if (block.type === 'thinking' && typeof block.thinking === 'string' && block.thinking.length > 0) sawReasoning = true
+          if (block.type !== 'thinking' && (block.type !== 'text' || (typeof block.text === 'string' && block.text.length > 0))) sawAnswerOrTool = true
+        }
+      })) {
+        if (chunk.type === 'usage') {
+          usage = chunk
+          continue
+        }
+        if (chunk.type === 'finish') {
+          finish = chunk
+          continue
+        }
+        if (chunk.type === 'reasoning-delta' && chunk.text.length > 0) sawReasoning = true
+        if (chunk.type === 'text-delta' && chunk.text.length > 0) sawAnswerOrTool = true
+        if ((chunk.type === 'block-start' && chunk.blockType === 'tool-call') || chunk.type === 'tool-call-delta') sawAnswerOrTool = true
+        if (chunk.type === 'block-end') {
+          if (chunk.block.type === 'reasoning' && chunk.block.text.length > 0) sawReasoning = true
+          if (chunk.block.type === 'tool-call' || (chunk.block.type === 'text' && chunk.block.text.length > 0)) sawAnswerOrTool = true
+        }
+        if (typeof chunk.index === 'number') nextIndex = Math.max(nextIndex, chunk.index + indexOffset + 1)
+        yield indexOffset === 0 ? chunk : { ...chunk, index: chunk.index + indexOffset }
+      }
+
+      const recover = attempt === 0 && canDisableThinking && sawReasoning && !sawAnswerOrTool
+        && finish?.reason.kind === 'max-tokens' && !options.signal?.aborted
+      if (recover) {
+        priorUsage = usage?.usage
+        indexOffset = nextIndex
+        request = { ...options, reasoningEffort: 'off', reasoning: 'off' }
+        continue
+      }
+      if (usage || priorUsage) {
+        const current = usage?.usage
+        const cacheReadTokens = (priorUsage?.cacheReadTokens ?? 0) + (current?.cacheReadTokens ?? 0)
+        const cacheWriteTokens = (priorUsage?.cacheWriteTokens ?? 0) + (current?.cacheWriteTokens ?? 0)
+        yield priorUsage === undefined ? usage! : {
+          type: 'usage',
+          usage: {
+            inputTokens: priorUsage.inputTokens + (current?.inputTokens ?? 0),
+            outputTokens: priorUsage.outputTokens + (current?.outputTokens ?? 0),
+            ...(cacheReadTokens > 0 ? { cacheReadTokens } : {}),
+            ...(cacheWriteTokens > 0 ? { cacheWriteTokens } : {}),
+          },
+        }
+      }
+      if (finish) yield finish
+      return
+    }
+  }
+
+  /** Stream one attempt from the Zen anonymous lane.
    *
    * IP-7 rotate loop (docs/ip-pool.md §3.4 / §8.1): a stream that dies
    * BEFORE any content landed restarts on a fresh exit — the pool's health
@@ -364,7 +437,7 @@ export class ZenAdapter {
    * partially delivered stream is never replayed). No pool running (or the
    * failure is not exit-shaped) = the original stream surface untouched.
    */
-  async *stream(options: HarnessGenerateOptions): AsyncGenerator<HarnessChunk> {
+  async *#streamAttempt(options: HarnessGenerateOptions, onTerminal?: (message: PiDoneMessage) => void): AsyncGenerator<HarnessChunk> {
     const context = await toPiContext(options)
     const ids = deriveRequestIDs(options.messages)
     const model = toPiModel(options.model, this.#catalog.reasoningCapability(options.model)?.reasoning === true, this.#catalog.limits?.(options.model))
@@ -452,6 +525,7 @@ export class ZenAdapter {
           lastEventAt = Date.now()
           if (event.type === 'error' || event.type === 'done') {
             clearTimeout(deadlineTimer)
+            onTerminal?.(event.type === 'done' ? event.message : event.error)
             yield event
             return
           }
@@ -475,12 +549,14 @@ export class ZenAdapter {
         lastEventAt = Date.now()
         sawAnyEvent = true
         if (event.type === 'error') {
+          onTerminal?.(event.error)
           preContentFailure = { message: event.error.errorMessage ?? 'pi-ai stream error' }
           // the event still flows to the consumer unless we rotate
           buffered.push(event)
           break
         }
         if (event.type === 'done') {
+          onTerminal?.(event.message)
           // pi-ai can also deliver the failure on done (stopReason: error)
           if (event.message.stopReason === 'error' && !deliveredContent) {
             preContentFailure = { message: event.message.errorMessage ?? 'pi-ai stream error' }
