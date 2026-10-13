@@ -135,14 +135,19 @@ function applyAdapter(
       if (lastError) logger.warn(`opencode2dsh: catalog refresh issue: ${lastError}`)
     },
   })
-  const adapter = new ZenAdapter(catalog)
+  const adapter = new ZenAdapter(catalog, {
+    firstEventMs: cfg.firstEventMs,
+    bodyIdleMs: cfg.bodyIdleMs,
+    responsesBodyIdleMs: cfg.responsesBodyIdleMs,
+  })
 
-  // Register FIRST: the provider must appear in the selector right away, even
-  // while the catalog is still warming up (listModels is read live at selector
-  // time, so models appear as refreshes land). Registration deliberately
-  // precedes every optional layer below — a throw anywhere in the ip-pool
-  // wiring, the stale-route sweep, or the refresh loop must never cost the
-  // deployment its only free provider.
+  // Register FIRST: the provider must appear in the selector right away. The
+  // host awaits listModels and caches its answer per host generation, so the
+  // registration-time read warms the catalog (bounded, issue #45) instead of
+  // handing the picker the staticFreeModels bootstrap list. Registration
+  // deliberately precedes every optional layer below — a throw anywhere in
+  // the ip-pool wiring, the stale-route sweep, or the refresh loop must never
+  // cost the deployment its only free provider.
   ctx.llm.registerAdapter([PROVIDER_ID], adapter)
   logger.info(`opencode2dsh: adapter registered for "${PROVIDER_ID}" (catalog warms up in background)`)
 

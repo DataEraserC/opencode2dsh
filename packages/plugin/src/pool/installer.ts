@@ -173,13 +173,22 @@ export class RoutingInstaller {
   disable(): void {
     if (!this.#enabled) return
     this.#enabled = false
-    if (this.#savedGlobalFetch !== null) {
+    const restoreFetch = this.#savedGlobalFetch !== null
+    if (restoreFetch) {
       ;(globalThis as { fetch: unknown }).fetch = this.#savedGlobalFetch
       this.#savedGlobalFetch = null
     }
+    let restored = false
+    // Destroy OUR layer before installing the previous one back: leaving the
+    // router alive while the slot points elsewhere would keep its per-exit
+    // ProxyAgents (and their sockets) in memory after the plugin is gone.
+    const dying = this.#current
+    this.#current = null
+    if (dying !== null) void dying.destroy().catch(() => {})
     if (this.#previous !== null) {
       try {
         this.#deps.undici.setGlobalDispatcher(this.#previous)
+        restored = true
       } catch {
         // the saved dispatcher may already be gone (host teardown) — our
         // uninstall still succeeded for our own layer
@@ -197,10 +206,20 @@ export class RoutingInstaller {
         // #detectForeignDispatcher still recovers the next install
       }
     }
-    const dying = this.#current
-    this.#current = null
-    if (dying !== null) void dying.destroy().catch(() => {})
-    this.#deps.logger?.info('opencode2dsh: exit routing disabled; previous global dispatcher restored')
+    if (!restored && dying !== null) {
+      // Nothing to restore (the slot was empty when we installed, or the
+      // saved dispatcher died with the host): hand undici its own default
+      // back so the process does not keep calling into a destroyed layer.
+      try {
+        this.#deps.undici.setGlobalDispatcher(new this.#deps.undici.Agent())
+        restored = true
+      } catch {}
+    }
+    this.#deps.logger?.info(
+      restored
+        ? `opencode2dsh: exit routing disabled; previous global dispatcher restored${restoreFetch ? ' and globalThis.fetch restored' : ''}`
+        : 'opencode2dsh: exit routing disabled; no previous dispatcher to restore',
+    )
   }
 
   /** Full teardown (plugin dispose): same as disable. */

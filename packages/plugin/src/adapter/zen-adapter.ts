@@ -5,7 +5,7 @@ import * as openaiResponses from '@earendil-works/pi-ai/api/openai-responses'
 import { ModelCatalog, ZEN_BASE_URL } from './catalog.ts'
 import { toStreamChunks, type HarnessChunk, type PiDoneMessage, type PiEvent } from './events.ts'
 import { deriveRequestIDs, disguiseHeaders } from './ids.ts'
-import { ensureFreeLaneShape, ensureResponsesFreeLaneShape, toPiContext, type HarnessGenerateOptions, type PiContext } from './messages.ts'
+import { ensureFreeLaneShape, ensureResponsesFreeLaneShape, GATE_TOOL_ALIASES, toPiContext, type HarnessGenerateOptions, type PiContext } from './messages.ts'
 import { apiForModel, isResponsesModel } from './routing.ts'
 export { apiForModel, isResponsesModel } from './routing.ts'
 import { routingContext, type RoutingContext } from '../pool/dispatcher.ts'
@@ -35,9 +35,20 @@ export interface ZenModelInfo {
 export interface CatalogLike {
   list(): string[]
   decision(model: string): { allowed: boolean; source: string; known: boolean }
+  /**
+   * Optional: bounded wait for the first live fetch (issue #45). listModels
+   * awaits it so the host's registration-time snapshot is the live roster,
+   * never the bootstrap list. Catalogs without it answer immediately from
+   * whatever they have.
+   */
+  warm?(ms?: number): Promise<void>
   reasoningCapability(model: string): { reasoning: boolean; effortValues: string[] } | undefined
   /** Optional: models.dev-declared limits; absent catalogs keep the defaults. */
   limits?(model: string): { contextWindow?: number; maxOutput?: number } | undefined
+  /** Optional: models.dev `modalities.input`, the input kinds the model
+   *  accepts (["text","image","video",…]). Absent catalogs keep the built-in
+   *  vision pattern. */
+  modalities?(model: string): string[] | undefined
 }
 
 const DEFAULT_CONTEXT_WINDOW = 262144
@@ -127,6 +138,23 @@ export function reasoningEffortWire(id: string | undefined): string | undefined 
 const ANONYMOUS_KEY = 'public'
 
 /**
+ * Retry policy the host (dsh-llm-retry) runs for this provider. Resolved
+ * shape is FLAT (backoff fields at top level — see ResolvedNormalRetryPolicy,
+ * dsh-llm index.js:1867 consumes the adapter value verbatim). Retryable codes
+ * mirror the host default set so behavior differs only in patience, not in
+ * which failures qualify. Cumulative worst case per step:
+ * 1+2+4+8+16+20+20+20 ≈ 91s of silent retries before the error surfaces.
+ */
+export const FREE_LANE_RETRY_POLICY = Object.freeze({
+  mode: 'normal' as const,
+  maxRetries: 8,
+  retryableCodes: Object.freeze(['EMPTY_RESPONSE', 'RATE_LIMIT', 'SERVER', 'TIMEOUT', 'TRANSPORT']),
+  initialDelayMs: 1_000,
+  maxDelayMs: 20_000,
+  jitterRatio: 0.2,
+})
+
+/**
  * Stream-liveness watchdogs (live-observed 2026-09-07): neither fetch nor
  * pi-ai owns a body-silence timeout, so a tunnel that stands but never
  * streams hangs the turn forever (70 minutes observed). Both messages
@@ -169,24 +197,42 @@ function terminalErrorEvent(errorMessage: string, model: Model<Api>): PiEvent {
  * on `POST /zen/v1/chat/completions` but 200 on `POST /zen/v1/responses`
  * (opencode #44659/#44847, DSH #3957). Route by model id; extend this list
  * if Zen moves more models (candidates: gpt-5.6-luna, grok-4.6).
+ *
+ * Issue #56 (2026-10-09): the gate added a canonical-session-header half on
+ * BOTH surfaces (adapter/messages.ts has the probed matrix); the official CLI
+ * v2 also calls /inference/openai directly for chat, but /zen/v1 stays the
+ * lane of record for this adapter — it answers 200 with the recipe and keeps
+ * `Bearer public` valid, which the inference surface 401s.
  */
 
 
 /**
- * Vision gate: ids whose image input is verified end-to-end on the Zen lane
- * (the mimo-v2.6 family — an image round-trip through DSH 0.1.7-rc.2 was
- * live-verified on 2026-09-28). Models outside the pattern stay text-only so
- * DSH's attachment gates and pi-ai's image downgrade both refuse image parts
- * instead of forwarding them to a model that cannot see them. DSH's per-model
- * input-type checkbox overrides the declared modalities whenever another lane
- * is verified later.
+ * Vision gate: whether a model accepts image input on the Zen lane.
+ *
+ * models.dev `modalities.input` decides whenever it speaks — the same
+ * declaration that already drives `limit.context` / `limit.output` lists the
+ * input kinds each model takes, and the free roster rotates constantly, so a
+ * family-scoped pattern cannot track it: space-bunny-free,
+ * muse-spark-1.*-contributor-free, mimo-v2.5-free, fledge-alpha-free and
+ * longcat-2.5-preview-free all declare `image` upstream and are refused today
+ * with `Model "<id>" does not support image input.` A declared text-only model
+ * stays refused, so the gate still protects the lane in both directions.
+ *
+ * The built-in pattern remains the fallback for the ids whose image input was
+ * live-verified end-to-end on 2026-09-28 (the mimo-v2.6 family), so metadata
+ * being pending, absent or silent never changes what those models can do.
+ * Models that end up text-only make DSH's attachment gates and pi-ai's image
+ * downgrade refuse image parts instead of forwarding them to a model that
+ * cannot see them.
  */
-export function isVisionModel(id: string): boolean {
+export function isVisionModel(id: string, declaredModalities?: string[]): boolean {
+  if (Array.isArray(declaredModalities) && declaredModalities.length > 0) {
+    return declaredModalities.includes('image')
+  }
   return /^mimo-v2\.6/i.test(String(id ?? ''))
 }
 
-function toPiModel(id: string, reasoning: boolean, limits?: { contextWindow?: number; maxOutput?: number }): Model<Api> {
-  const isResponses = isResponsesModel(id)
+function toPiModel(id: string, reasoning: boolean, limits?: { contextWindow?: number; maxOutput?: number }, declaredModalities?: string[]): Model<Api> {
   return {
     id,
     name: id,
@@ -196,13 +242,13 @@ function toPiModel(id: string, reasoning: boolean, limits?: { contextWindow?: nu
     // The honest capability flag: gates pi-ai's reasoning_effort branch and
     // keeps developer-role replay suppressed (the Zen lane's compat detects
     // supportsDeveloperRole=false for opencode.ai, so the system slot is
-    // unchanged either way). `image` (vision models only, see isVisionModel)
-    // keeps pi-ai's downgradeUnsupportedImages from dropping the image parts
-    // toPiContext loads from the attachment store (the Zen gateway accepts
-    // image_url data URLs, live-probed 2026-09-23; full round-trip through
+    // unchanged either way). `image` (see isVisionModel) keeps pi-ai's
+    // downgradeUnsupportedImages from dropping the image parts toPiContext
+    // loads from the attachment store (the Zen gateway accepts image_url
+    // data URLs, live-probed 2026-09-23; full round-trip through
     // DSH 0.1.7-rc.2 with mimo-v2.6-flash-free 2026-09-28).
     reasoning,
-    input: isVisionModel(id) ? ['text', 'image'] : ['text'],
+    input: isVisionModel(id, declaredModalities) ? ['text', 'image'] : ['text'],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: contextWindowFor(limits),
     maxTokens: defaultMaxTokensFor(limits),
@@ -295,11 +341,18 @@ export class ZenAdapter {
   }
 
   /**
-   * dsh-llm calls this unconditionally at registration (index.js:1208).
-   * undefined = the host default retry policy, matching sidecar behavior.
+   * Provider-owned retry policy (dsh-llm calls this unconditionally at
+   * registration, index.js:1208). The anonymous free lane 429s in bursts —
+   * live-probed 2026-10-09 (issue #51): 5/8 immediate failures on
+   * step-5-preview-free, with contention windows that outlast the host
+   * default (5 retries over ~15s), so transient throttling surfaced as
+   * user-visible errors. This policy stretches the silent absorption window
+   * to ~90s per step (8 retries, 1s→20s backoff, wider jitter). Retryable
+   * codes mirror the host default set; deterministic failures (AUTH,
+   * REGION_BLOCKED, INVALID_REQUEST) stay non-retryable.
    */
-  providerRetryPolicy(_provider: string): undefined {
-    return undefined
+  providerRetryPolicy(_provider: string): typeof FREE_LANE_RETRY_POLICY {
+    return FREE_LANE_RETRY_POLICY
   }
 
   /** No image pricing for the free Zen lane. */
@@ -307,14 +360,26 @@ export class ZenAdapter {
     return undefined
   }
 
-  /** Advisory catalog for the DSH model picker (deduped; dsh-llm rejects duplicates). */
-  listModels(provider: string): Array<{ provider: string; id: string; name: string; inputModalities: string[] }> {
+  /** The input kinds DSH is told about for one model (isVisionModel). */
+  #inputModalities(model: string): string[] {
+    return isVisionModel(model, this.#catalog.modalities?.(model)) ? ['text', 'image'] : ['text']
+  }
+
+  /**
+   * Advisory catalog for the DSH model picker (deduped; dsh-llm rejects
+   * duplicates). Async on purpose (issue #45): the host awaits this call and
+   * caches its answer per host generation, so the first read waits —
+   * bounded, inside the catalog — for the live Zen fetch instead of handing
+   * the host the staticFreeModels bootstrap list it would then keep showing.
+   */
+  async listModels(provider: string): Promise<Array<{ provider: string; id: string; name: string; inputModalities: string[] }>> {
+    await this.#catalog.warm?.()
     const seen = new Set<string>()
     const models: Array<{ provider: string; id: string; name: string; inputModalities: string[] }> = []
     for (const id of this.#catalog.list()) {
       if (seen.has(id)) continue
       seen.add(id)
-      models.push({ provider, id, name: id, inputModalities: isVisionModel(id) ? ['text', 'image'] : ['text'] })
+      models.push({ provider, id, name: id, inputModalities: this.#inputModalities(id) })
     }
     return models
   }
@@ -332,7 +397,7 @@ export class ZenAdapter {
       provider,
       id: model,
       name: model,
-      inputModalities: isVisionModel(model) ? ['text', 'image'] : ['text'],
+      inputModalities: this.#inputModalities(model),
       context: { contextWindow: contextWindowFor(this.#catalog.limits?.(model)) },
       defaultMaxTokens: defaultMaxTokensFor(this.#catalog.limits?.(model)),
     }
@@ -440,7 +505,7 @@ export class ZenAdapter {
   async *#streamAttempt(options: HarnessGenerateOptions, onTerminal?: (message: PiDoneMessage) => void): AsyncGenerator<HarnessChunk> {
     const context = await toPiContext(options)
     const ids = deriveRequestIDs(options.messages)
-    const model = toPiModel(options.model, this.#catalog.reasoningCapability(options.model)?.reasoning === true, this.#catalog.limits?.(options.model))
+    const model = toPiModel(options.model, this.#catalog.reasoningCapability(options.model)?.reasoning === true, this.#catalog.limits?.(options.model), this.#catalog.modalities?.(options.model))
     // IP-pool routing context (docs/ip-pool.md 3.3): pi-ai builds the request
     // body and dispatches it on separate layers with no channel for "which
     // model is this fetch for", so the per-request context rides AsyncLocalStorage.
@@ -576,13 +641,13 @@ export class ZenAdapter {
       // deadline timer is spent (pumpLive re-arms its own per pull)
       clearTimeout(deadlineTimer)
       if (preContentFailure === null && deliveredContent) {
-        yield* toStreamChunks(pumpLive(), model.contextWindow)
+        yield* toStreamChunks(pumpLive(), model.contextWindow, GATE_TOOL_ALIASES)
         return
       }
       if (preContentFailure === null && !deliveredContent) {
         // stream ended cleanly with no content and no error: pass through
         // (pi-ai's empty-response classification owns this case)
-        yield* toStreamChunks((async function* pumped() { for (const e of buffered) yield e })(), model.contextWindow)
+        yield* toStreamChunks((async function* pumped() { for (const e of buffered) yield e })(), model.contextWindow, GATE_TOOL_ALIASES)
         return
       }
       // Exit-shaped failure before content: ask the pool whether rotating is
@@ -613,7 +678,7 @@ export class ZenAdapter {
             break
           }
         }
-        yield* toStreamChunks((async function* pumped() { for (const e of buffered) yield e })(), model.contextWindow)
+        yield* toStreamChunks((async function* pumped() { for (const e of buffered) yield e })(), model.contextWindow, GATE_TOOL_ALIASES)
         return
       }
       // rotate: loop re-runs #eventsFor inside the same ALS store; the pool

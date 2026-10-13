@@ -2,6 +2,12 @@
  * pi-ai AssistantMessageEvent -> harness StreamChunks. Clean-room port of
  * dsh-llm-pi-ai toStreamChunks (verified against its source, index.js:1342-1452):
  * the chunk stream must end with `usage` then `finish`.
+ *
+ * `toolNameAlias` (issue #56 seam): inbound wire tool names rewritten before
+ * the chunks leave the adapter — e.g. { shell: 'bash' } if a future gate
+ * spelling forces the `shell` alias for the host's bash tool. The shipped
+ * recipe needs no alias (adapter/messages.ts), so the adapter passes its
+ * (empty) GATE_TOOL_ALIASES and names pass through unchanged.
  */
 
 export type HarnessChunk =
@@ -129,8 +135,13 @@ function mapUsage(usage: PiDoneMessage['usage']): Extract<HarnessChunk, { type: 
  * mid-stream: failures arrive as `error` events and become error/aborted
  * finish chunks.
  */
-export async function* toStreamChunks(events: AsyncIterable<PiEvent>, contextWindow: number): AsyncGenerator<HarnessChunk> {
+export async function* toStreamChunks(
+  events: AsyncIterable<PiEvent>,
+  contextWindow: number,
+  toolNameAlias?: Record<string, string>,
+): AsyncGenerator<HarnessChunk> {
   const toolIds = new Map<number, { id: string; name: string }>()
+  const mapName = (name: string): string => toolNameAlias?.[name] ?? name
   for await (const event of events) {
     switch (event.type) {
       case 'start':
@@ -156,7 +167,7 @@ export async function* toStreamChunks(events: AsyncIterable<PiEvent>, contextWin
       case 'toolcall_start': {
         const partial = event.partial.content[event.contentIndex]
         const id = partial?.type === 'toolCall' ? (partial.id ?? '') : ''
-        const name = partial?.type === 'toolCall' ? (partial.name ?? '') : ''
+        const name = partial?.type === 'toolCall' ? mapName(partial.name ?? '') : ''
         toolIds.set(event.contentIndex, { id, name })
         yield { type: 'block-start', index: event.contentIndex, blockType: 'tool-call' }
         break
@@ -179,7 +190,7 @@ export async function* toStreamChunks(events: AsyncIterable<PiEvent>, contextWin
           block: {
             type: 'tool-call',
             id: event.toolCall.id,
-            name: event.toolCall.name,
+            name: mapName(event.toolCall.name),
             arguments: JSON.stringify(event.toolCall.arguments),
           },
         }

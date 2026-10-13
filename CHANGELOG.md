@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.3.11 (2026-10-11)
+
+### Fixed
+
+- Anonymous free-lane chats survive the session-header gate that went live ~2026-10-09 (#56). Ablation probes against the live lane (2026-10-11) pin the gate to a canonical `ses_*` id in a session header (`x-opencode-session` / `x-session-affinity` / `X-Session-Id`, any one) — not the endpoint or the credential: `/zen/v1` + `Bearer public` + the canonical session the adapter already sends still answers 200, while `/inference/openai` 401s the Bearer. The one path that actually broke was the IP-pool admission smoke probe, which built its own request without the disguise headers; it now sends the full set. Also from the issue's live matrix: a `FREE_LANE_BLOCKLIST` denies the five models the lane can never serve (`exo-free` 410, `jev-1.13-free` SystemOne-only 400, `ling-3.0-flash-fin-free` 400, `muse-spark-1.*-contributor-free` 403 RegionError) ahead of any metadata or S3 vouch, in `list()` and `decision()` alike; and a `LOCAL_MODEL_OVERRIDES` table corrects models.dev's `mimo-v2.6-flash-free` context window (200000 → 1048576, per the MiMo card and the official CLI config). A `GATE_TOOL_ALIASES` seam (with `toolNameAlias` on `toStreamChunks`) stays ready for a future gate spelling that forces a wire alias such as `shell`.
+- Cold boots no longer reject an explicit reasoning effort with `UNSUPPORTED_REASONING_EFFORT` when models.dev is slower than `warm()`'s window (#55). `refreshMetadata()` is now stale-while-revalidate: a fresh disk cache (< 7 days) loads as the capability baseline BEFORE the online fetch, so `reasoningCapability()`/`limits()`/`modalities()` answer immediately on a slow-but-healthy network (23s observed); the online answer still replaces the baseline when it lands, and the failure fallback is unchanged.
+
+## 0.3.10 (2026-10-09)
+
+### Fixed
+
+- Tool results from DSH >= 0.2 hosts now land in the `toolResult` slot instead of being re-emitted as phantom `user` messages (#50). dsh-llm 0.2.0-rc.2's `createToolResultMessage` puts the call id on the message (`role: 'tool'`, `toolCallId`, `source.callId`) with plain content blocks and no `tool-result` wrapper, but `toPiContext()` only looked for wrapper blocks — so every tool result arrived as a new user message while no `toolResult` was ever sent, making models report "the tool returned nothing" (`No result provided`) and mistake tool output for user input. A message with no `tool-result` content blocks but a message-level call id now emits exactly one `toolResult` (never a user message); the wrapper-block path keeps precedence so DSH 0.1.x hosts — whose `isError` lives on the block — behave byte-identically. Reproduced and fixed-verified against the real dsh 0.2.0-rc.2 CLI with a control group (stock 0.3.9 reproduces the issue verbatim; the patched build returns the real stdout in the tool slot with no new user message).
+- Free-lane 429 bursts are now ridden out silently instead of surfacing mid-conversation (#51). The adapter's `providerRetryPolicy` hook was returning `undefined`, deferring to the host default (5 retries over ~15s), which transient Zen quota windows (~60s, as measured by the IP pool's cooldown bookkeeping) outlasted — a live probe of the reporter's exact combo (`step-5-preview-free`, high effort) saw 5/8 requests immediately 429'd. The returned policy now runs 8 retries with 1s→20s backoff (~91s silent absorption per step, retries still executed — and cancellable — by the host, with the default retryable-code set so deterministic AUTH/REGION_BLOCKED failures are never retried). Live A/B on the same lane: unretryed baseline 5/8 ok, tuned policy 6/6 + 8/8 with bursts absorbed invisibly, stock-policy control stalled one request for 154s where the tuned spacing kept the worst request at 5.2s; real DSH 0.2.0-rc.2 headless e2e (3 sequential tool calls, high effort) completed cleanly.
+
+## 0.3.9 (2026-10-08)
+
+### Fixed
+
+- Exit routing now restores the host's global dispatcher on disable and plugin unload. `install()` read the replaced dispatcher off `setGlobalDispatcher()`'s return value, which is `void` on undici 8.x, so the previous dispatcher was never saved and `disable()` left the `PoolRoutingDispatcher` installed process-wide: every later `fetch` — including unrelated providers' requests — kept routing through the plugin, failing with `routing dispatcher closed` after teardown, and only a process restart cleared it. The outgoing dispatcher is now captured with `getGlobalDispatcher()` before the swap, ours is destroyed before the previous one is reinstalled, a fresh undici `Agent` takes over when nothing was saved, and the "restored" log line only appears when a restore actually happened. The installer test fixture no longer models a `setGlobalDispatcher` that returns the replaced dispatcher (the fiction that hid this bug from the suite).
+
+## 0.3.8 (2026-10-08)
+
+### Fixed
+
+- Manual `ipPool.manual` entries keep the scheme the settings card requires. Admission prefixed its own scheme onto an address that already carried one, so `http://host:port` built `http://http://host:port`, undici's `ProxyAgent` threw `InvalidArgumentError`, and the trusted-source fallback admitted the node with empty facts — the pool read healthy while exit IP, latency, quality and the geo/latency gates never ran for manual exits. Both admission call sites now reuse `exitProxyUri`, the guard the routing path already had, so the two paths cannot drift apart again.
+- The model picker no longer sticks to the bootstrap list after a plugin (re)load. Registration-time `listModels()` answered from the 7-id static fallback whenever the client's first read beat the first Zen fetch, and the host caches that snapshot for its whole generation (delisted `mimo-v2.5-free` shown, live ids such as `exo-free` missing). `listModels()` is now async — the host contract already awaits it — and waits for the live catalog, bounded to 4 s so a dead network still answers promptly with the static list; concurrent warmups share `start()`'s in-flight first fetch.
+
+## 0.3.7 (2026-10-04)
+
+### Added
+
+- The stream-liveness watchdogs are configurable. `firstEventMs`, `bodyIdleMs`, and `responsesBodyIdleMs` widen how long a turn waits for the first stream event and how much mid-response silence it tolerates, so a slow cold start no longer has to fail as `first stream event timeout` with no recourse. Unset, the shipped 30 s / 120 s / 300 s windows still apply.
+- Add `mimo-v2.6-flash-free` to the static free-model fallback and IP-pool probe choices.
+
+### Fixed
+
+- Image input follows the model's declared modalities instead of a hardcoded
+  family. models.dev publishes `modalities.input` per model, but it was never
+  read, so every model outside `/^mimo-v2\.6/i` was advertised as text-only
+  and DSH refused the attachment with `Model "…" does not support image input.`
+  A model that declares `image` is now accepted, one that declares only `text`
+  is still refused, and models.dev being pending, absent or silent leaves the
+  verified family exactly as it was.
+
 ## 0.3.6 (2026-10-01)
 
 ### Fixed

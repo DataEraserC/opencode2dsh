@@ -25,8 +25,15 @@ export type HarnessBlock =
   | { type: 'tool-result'; toolCallId: string; content: HarnessBlock[]; isError?: boolean; [key: string]: unknown }
 
 export interface HarnessMessage {
-  role: 'system' | 'user' | 'assistant'
+  /**
+   * DSH >= 0.2 delivers tool results as `role: 'tool'` messages with the call
+   * id at the message level; older hosts wrap them in `role: 'user'` messages
+   * carrying `tool-result` content blocks. Both shapes are handled.
+   */
+  role: 'system' | 'user' | 'assistant' | 'tool'
   content: HarnessBlock[]
+  toolCallId?: string
+  isError?: boolean
   source?: { kind: string; provider?: string; model?: string; callId?: string; [key: string]: unknown }
 }
 
@@ -231,6 +238,42 @@ function flattenText(message: HarnessMessage): string {
 }
 
 /**
+ * Call id of a message-level tool result (DSH >= 0.2: `role: 'tool'`,
+ * `toolCallId` on the message, plain content blocks, `source.callId` as a
+ * mirror). Returns undefined for ordinary user/system messages. Only consult
+ * `source.callId` when the source is a tool, so model/user provenance can
+ * never be mistaken for a tool result.
+ */
+function messageToolCallId(message: HarnessMessage): string | undefined {
+  if (typeof message.toolCallId === 'string' && message.toolCallId.length > 0) return message.toolCallId
+  const source = message.source
+  if (source?.kind === 'tool' && typeof source.callId === 'string' && source.callId.length > 0) return source.callId
+  return undefined
+}
+
+/** Emit one pi-ai toolResult, substituting a placeholder for empty output. */
+async function pushToolResult(
+  messages: PiMessage[],
+  toolNames: Map<string, string>,
+  toolCallId: string,
+  content: HarnessBlock[],
+  isError: boolean,
+): Promise<void> {
+  let rparts = await toolResultParts(content)
+  const hasImage = rparts.some((part) => part.type === 'image')
+  const hasText = rparts.some((part) => part.type === 'text' && part.text.length > 0)
+  if (!hasImage && !hasText) rparts = [{ type: 'text', text: '(no output)' }]
+  messages.push({
+    role: 'toolResult',
+    toolCallId,
+    toolName: toolNames.get(toolCallId) ?? 'unknown',
+    content: rparts,
+    isError,
+    timestamp: 0,
+  })
+}
+
+/**
  * Convert the harness conversation into a pi-ai Context. User and tool-result
  * messages keep text AND image blocks (images load from the harness
  * attachment store); tool results as toolResult messages, assistant history as
@@ -254,10 +297,21 @@ export async function toPiContext(options: HarnessGenerateOptions): Promise<PiCo
       messages.push(assistant)
       continue
     }
-    const parts = await userParts(message.content)
     const results = message.content.filter((block) => block.type === 'tool-result') as Array<
       Extract<HarnessBlock, { type: 'tool-result' }>
     >
+    if (results.length === 0) {
+      // DSH >= 0.2 tool result: call id lives on the message, content is
+      // plain text/image blocks. It must land in the toolResult slot only —
+      // emitting it as a user message makes the model mistake tool output
+      // for user input (and the real toolResult is never sent).
+      const toolCallId = messageToolCallId(message)
+      if (toolCallId !== undefined) {
+        await pushToolResult(messages, toolNames, toolCallId, message.content, message.isError ?? false)
+        continue
+      }
+    }
+    const parts = await userParts(message.content)
     if (parts.length > 0 || results.length === 0) {
       const first = parts[0]
       let content: string | PiContentBlock[]
@@ -267,18 +321,7 @@ export async function toPiContext(options: HarnessGenerateOptions): Promise<PiCo
       messages.push({ role: 'user', content, timestamp: 0 })
     }
     for (const result of results) {
-      let rparts = await toolResultParts(result.content)
-      const hasImage = rparts.some((part) => part.type === 'image')
-      const hasText = rparts.some((part) => part.type === 'text' && part.text.length > 0)
-      if (!hasImage && !hasText) rparts = [{ type: 'text', text: '(no output)' }]
-      messages.push({
-        role: 'toolResult',
-        toolCallId: result.toolCallId,
-        toolName: toolNames.get(result.toolCallId) ?? 'unknown',
-        content: rparts,
-        isError: result.isError ?? false,
-        timestamp: 0,
-      })
+      await pushToolResult(messages, toolNames, result.toolCallId, result.content, result.isError ?? false)
     }
   }
   const context: PiContext = { messages }
@@ -289,14 +332,31 @@ export async function toPiContext(options: HarnessGenerateOptions): Promise<PiCo
 }
 
 /**
- * The Zen anonymous free lane (live-probed 2026-09-18) rejects chat bodies
- * that do not carry an agent shape: HTTP 403 FreeTierError unless the body
- * streams (`stream: true`) and its `tools` array includes function tools
- * named "bash" AND "read" — descriptions, parameters and every header
- * (User-Agent included) go uninspected. pi-ai always streams, so the
- * chat-path gap is tools only: plain conversations carry none.
+ * The anonymous free-lane gate (~2026-10-09, issue #56; live-probed again
+ * 2026-10-11): a chat request passes with HTTP 200 only when ALL hold:
+ *   1. a canonical `ses_*` id in a session header (`x-opencode-session`,
+ *      `x-session-affinity` and `X-Session-Id` all work — any ONE suffices;
+ *      bad-shape ids 403);
+ *   2. a streaming body (`stream: true` — non-stream 403s);
+ *   3. an agent-shaped `tools` array: `bash`+`read` pass (200), `shell`+1
+ *      known name pass (200), but `bash` alone, `shell` alone, and 5 known
+ *      names WITHOUT bash/shell all 403. Schemas and descriptions go
+ *      uninspected.
+ * The `Bearer public` credential and the User-Agent spelling are NOT gates
+ * (both pass on /zen/v1; only /inference/openai 401s the Bearer). The shipped
+ * recipe stays the 2026-09-18 bash+read pair: minimal, host-named, and valid
+ * on both the /zen and /inference lanes.
  */
 export const FREE_LANE_GATE_TOOL_NAMES = ['bash', 'read'] as const
+
+/**
+ * Inbound tool-call names rewritten before the chunk stream leaves the
+ * adapter (zen-adapter.ts hands this to toStreamChunks). Empty on the shipped
+ * recipe: every injected stub is call-disabled or host-named, so nothing the
+ * model can call needs a rename. Kept as the seam for a future gate spelling
+ * that forces an alias (e.g. a mandatory `shell`).
+ */
+export const GATE_TOOL_ALIASES: Record<string, string> = {}
 
 export interface FreeLaneGateTool {
   type: 'function'

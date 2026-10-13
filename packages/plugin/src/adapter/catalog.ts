@@ -16,10 +16,29 @@ import { opencodeUserAgent } from './ids.ts'
 
 export const ZEN_BASE_URL = 'https://opencode.ai/zen'
 
+/**
+ * Free-lane blocklist (issue #56 live matrix, 2026-10-10): models the live
+ * chat lane can never serve. The Zen catalog still lists them, so S1 alone
+ * exposes dead ids — one exclusion reason per model:
+ *   exo-free                             410 ModelDeprecated (upstream delisted)
+ *   jev-1.13-free                        400 ModelProtocolUnsupported (SystemOne-only)
+ *   ling-3.0-flash-fin-free              400 "Model is unavailable" (upstream-side)
+ *   muse-spark-1.*-contributor-free      403 RegionError, chat and responses alike
+ * Remove an entry only after a live probe of the chat lane answers 200/429.
+ */
+export const FREE_LANE_BLOCKLIST: ReadonlySet<string> = new Set([
+  'exo-free',
+  'jev-1.13-free',
+  'ling-3.0-flash-fin-free',
+  'muse-spark-1.2-contributor-free',
+  'muse-spark-1.3-contributor-free',
+])
+
 /** Verified against the anonymous lane with a real chat (agent/internal/catalog/static_models.go). */
 export const staticFreeModels: string[] = [
   'big-pickle', // verified 2026-08-28: anonymous chat 200 (non-stream + stream)
-  'mimo-v2.5-free', // verified 2026-08-28: anonymous chat 200 (non-stream)
+  'mimo-v2.5-free', // verified 2026-08-28: anonymous chat 200 (non-stream); models.dev deprecated since 2026-10-03, still answers
+  'mimo-v2.6-flash-free', // verified 2026-10-03: anonymous chat 200 (stream, adapter path); successor of mimo-v2.5-free
   'ling-3.0-flash-fin-free', // verified 2026-09-01: anonymous chat 200
   'nemotron-3.5-lightning-free', // verified 2026-09-01: anonymous chat 200
   'nemotron-3-ultra-free', // verified 2026-09-01: anonymous chat 200 (7s, earlier timeout was transient)
@@ -55,6 +74,10 @@ interface ModelPrice {
   contextWindow?: number
   /** models.dev `limit.output`: the model's real max output tokens. */
   maxOutput?: number
+  /** models.dev `modalities.input`: the input kinds the model accepts
+   *  (["text","image","video",…]). Absent when the metadata declares none, so
+   *  the adapter keeps its own vision pattern for such a model. */
+  modalities?: string[]
 }
 
 /** Decide (model_metadata.go Decide, ported with the deprecation fix).
@@ -83,6 +106,24 @@ export function decide(model: string, prices: Map<string, ModelPrice>, ready: bo
     return { allowed: false, source: 'metadata_cost_unknown', known: false }
   }
   return { allowed: false, source: 'metadata_paid', known: true }
+}
+
+/**
+ * models.dev fields the plugin knowingly overrides (issue #56 metadata note):
+ * the feed declares `mimo-v2.6-flash-free` with `limit.context: 200000`, while
+ * the MiMo V2.6 Flash model card and the official OpenCode CLI config use
+ * 1048576. Checked BEFORE the metadata in `limits()`/`reasoningCapability()`/
+ * `modalities()` — a fixed feed deletes its entry here.
+ */
+const LOCAL_MODEL_OVERRIDES: Readonly<Record<string, Partial<ModelPrice>>> = {
+  'mimo-v2.6-flash-free': { contextWindow: 1048576 },
+}
+
+/** Shallow per-field override: declared fields win, the rest pass through. */
+function applyLocalOverride(model: string, price: ModelPrice | undefined): ModelPrice | undefined {
+  const override = LOCAL_MODEL_OVERRIDES[model]
+  if (override === undefined) return price
+  return { ...price, ...override } as ModelPrice
 }
 
 /**
@@ -121,10 +162,12 @@ export function decodeModelsDev(data: unknown): Map<string, ModelPrice> {
       const modelId = typeof raw.id === 'string' && raw.id.length > 0 ? raw.id : modelKey
       const cost = (raw.cost ?? {}) as Record<string, unknown>
       const limit = (raw.limit ?? {}) as Record<string, unknown>
+      const modalities = (raw.modalities ?? {}) as Record<string, unknown>
       const num = (value: unknown): number | undefined =>
         typeof value === 'number' && Number.isFinite(value) ? value : undefined
       const contextWindow = num(limit.context)
       const maxOutput = num(limit.output)
+      const inputModalities = decodeModalities(modalities.input)
       result.set(modelId, {
         input: num(cost.input),
         output: num(cost.output),
@@ -134,6 +177,9 @@ export function decodeModelsDev(data: unknown): Map<string, ModelPrice> {
         // Omitted when absent so caches written before limits existed stay valid.
         ...(contextWindow !== undefined ? { contextWindow } : {}),
         ...(maxOutput !== undefined ? { maxOutput } : {}),
+        // Same for modalities: a cache written before this field existed carries
+        // none, and the adapter then keeps its built-in vision pattern.
+        ...(inputModalities !== undefined ? { modalities: inputModalities } : {}),
       })
     }
     if (result.size > 0) return result
@@ -168,6 +214,21 @@ function decodeEffortValues(raw: unknown): { effortValues?: string[] } {
     }
   }
   return values.length > 0 ? { effortValues: values } : { effortValues: [] }
+}
+
+/**
+ * models.dev `modalities.input` (live shape 2026-09-28): an array of lowercase
+ * kind strings such as ["text","image","video","pdf","audio"]. Only a non-empty
+ * array of non-empty strings is kept, so a malformed or absent field speaks for
+ * nothing and the adapter keeps its own vision pattern (isVisionModel).
+ */
+function decodeModalities(input: unknown): string[] | undefined {
+  if (!Array.isArray(input)) return undefined
+  const kinds: string[] = []
+  for (const kind of input) {
+    if (typeof kind === 'string' && kind.length > 0 && !kinds.includes(kind)) kinds.push(kind)
+  }
+  return kinds.length > 0 ? kinds : undefined
 }
 
 export interface CatalogSnapshot {
@@ -223,6 +284,8 @@ export class ModelCatalog {
   #stopped = false
   #onRefresh?: (status: CatalogSnapshot, lastError: string) => void
   #startupRetryMs: number
+  /** In-flight refresh round (deduped so warm() shares start()'s first fetch). */
+  #refreshing: Promise<void> | null = null
 
   constructor(options: CatalogOptions = {}) {
     this.#refreshSeconds = options.refreshSeconds ?? 300
@@ -264,7 +327,19 @@ export class ModelCatalog {
     }
   }
 
-  async refreshOnce(): Promise<void> {
+  /** One refresh round, deduped while in flight: a concurrent caller (warm()
+   *  racing start()'s first round, or the interval timer) joins the running
+   *  round instead of firing a parallel fetch of the same endpoints. */
+  refreshOnce(): Promise<void> {
+    if (this.#refreshing === null) {
+      this.#refreshing = this.#refreshRound().finally(() => {
+        this.#refreshing = null
+      })
+    }
+    return this.#refreshing
+  }
+
+  async #refreshRound(): Promise<void> {
     await Promise.allSettled([this.refreshZen(), this.refreshMetadata()])
     if (this.#onRefresh) {
       try {
@@ -287,6 +362,21 @@ export class ModelCatalog {
   }
 
   async refreshMetadata(): Promise<void> {
+    // Stale-while-revalidate (issue #55): on a cold boot a slow-but-healthy
+    // models.dev (23s observed) outlives warm()'s window and never touches the
+    // failure fallback below — capability reads (reasoning efforts, limits,
+    // modalities) then see an empty map and the host rejects explicit efforts
+    // with UNSUPPORTED_REASONING_EFFORT. Load a fresh disk cache as the
+    // baseline FIRST, then let the online fetch replace it whenever it lands.
+    // Only the refresh-triggered path does this; start()'s first round is
+    // exactly that path, so cold boots are covered.
+    if (this.#cachePath && !this.#pricesReady) {
+      const cached = await loadMetadataCache(this.#cachePath, this.#now).catch(() => null)
+      if (cached && cached.size > 0) {
+        this.#prices = cached
+        this.#pricesReady = true
+      }
+    }
     try {
       const response = await withTimeout(this.#fetch(this.#metadataUrl, { headers: { accept: 'application/json' } }))
       if (!response.ok) throw new Error(`models.dev returned HTTP ${response.status}`)
@@ -299,7 +389,7 @@ export class ModelCatalog {
     } catch (err) {
       // Network failure with a cached copy is not fatal: load the cache.
       if (this.#cachePath && !this.#pricesReady) {
-        const cached = await loadMetadataCache(this.#cachePath).catch(() => null)
+        const cached = await loadMetadataCache(this.#cachePath, this.#now).catch(() => null)
         if (cached && cached.size > 0) {
           this.#prices = cached
           this.#pricesReady = true
@@ -310,7 +400,30 @@ export class ModelCatalog {
     }
   }
 
+  /**
+   * Resolve once the first live fetch has settled, so a model-list read is
+   * never answered from the bootstrap list (issue #45: the host caches the
+   * snapshot its picker took at adapter registration, and the re-read
+   * triggers are topology/settings events a warming catalog never fires —
+   * so the 7-id staticFreeModels roster could stick for the whole host
+   * generation). Bounded: a dead network still answers promptly with the
+   * static list. Joins start()'s in-flight round when one exists (no
+   * duplicate fetch), or triggers a round of its own when none does.
+   */
+  async warm(ms = 4_000): Promise<void> {
+    if (this.#zen.size > 0 || this.#stopped) return
+    const timeout = new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, ms)
+      timer.unref?.()
+    })
+    await Promise.race([this.refreshOnce().catch(() => {}), timeout])
+  }
+
   decision(model: string): AnonymousDecision {
+    // Issue #56: the live chat lane can never serve a blocklisted id (410
+    // delisted / 400 unavailable / 403 region) — deny before any metadata or
+    // S3 vouch, so a stale cache or the bootstrap list cannot resurrect it.
+    if (FREE_LANE_BLOCKLIST.has(model)) return { allowed: false, source: 'local_blocklist', known: true }
     const metadata = decide(model, this.#prices, this.#pricesReady)
     // The S3 vouch only covers ids metadata cannot speak for. A metadata
     // verdict of deprecated is Known, but S3 entries are compile-time verified
@@ -328,7 +441,7 @@ export class ModelCatalog {
 
   /** ids exposed to DSH: S1 ∩ allowed, or S3 while the live catalog is pending. */
   list(): string[] {
-    if (this.#zen.size === 0) return [...staticFreeModels]
+    if (this.#zen.size === 0) return staticFreeModels.filter((model) => !FREE_LANE_BLOCKLIST.has(model))
     const out: string[] = []
     for (const model of this.#zen) {
       if (this.decision(model).allowed) out.push(model)
@@ -343,7 +456,7 @@ export class ModelCatalog {
    * then keeps its own defaults.
    */
   limits(model: string): { contextWindow?: number; maxOutput?: number } | undefined {
-    const price = this.#prices.get(model)
+    const price = applyLocalOverride(model, this.#prices.get(model))
     if (!price) return undefined
     if (price.contextWindow === undefined && price.maxOutput === undefined) return undefined
     return {
@@ -353,13 +466,24 @@ export class ModelCatalog {
   }
 
   /**
+   * models.dev `modalities.input` for one model: the input kinds it accepts
+   * (["text","image","video",…]). undefined when the metadata cannot speak for
+   * the model (pending, or id absent) or declares no modalities — the caller
+   * then keeps its own vision pattern (isVisionModel).
+   */
+  modalities(model: string): string[] | undefined {
+    const modalities = applyLocalOverride(model, this.#prices.get(model))?.modalities
+    return modalities === undefined ? undefined : [...modalities]
+  }
+
+  /**
    * models.dev reasoning capability for one model: `reasoning` flags the
    * always-think models, `effortValues` the declared selectable levels
    * (empty array = reasons but declares no ladder). undefined when the
    * metadata cannot speak for the model (pending, or id absent).
    */
   reasoningCapability(model: string): { reasoning: boolean; effortValues: string[] } | undefined {
-    const price = this.#prices.get(model)
+    const price = applyLocalOverride(model, this.#prices.get(model))
     if (!price) return undefined
     return { reasoning: price.reasoning === true, effortValues: price.effortValues ?? [] }
   }
@@ -431,9 +555,9 @@ async function saveMetadataCache(path: string, prices: Map<string, ModelPrice>, 
   await rename(tmp, path)
 }
 
-async function loadMetadataCache(path: string): Promise<Map<string, ModelPrice>> {
+async function loadMetadataCache(path: string, now: () => number = Date.now): Promise<Map<string, ModelPrice>> {
   const raw = JSON.parse(await readFile(path, 'utf8')) as MetadataCache
-  if (Date.now() - raw.updatedAt > 7 * METADATA_REFRESH_MS) {
+  if (now() - raw.updatedAt > 7 * METADATA_REFRESH_MS) {
     throw new Error('models.dev cache too old')
   }
   return new Map(raw.prices)

@@ -5,7 +5,7 @@ import http from 'node:http'
 import * as realUndici from 'undici'
 
 import { ExitPool } from '../src/pool/pool.ts'
-import { admitCandidate, admitTrusted } from '../src/pool/admission.ts'
+import { admitCandidate, admitTrusted, coarseScreen } from '../src/pool/admission.ts'
 
 /**
  * A fake per-request transport: the seam `undici.request` would hit. Each
@@ -15,10 +15,12 @@ import { admitCandidate, admitTrusted } from '../src/pool/admission.ts'
 function fakeTransport(script: Record<string, { status: number; body: string } | Error>) {
   const calls: string[] = []
   const bodies = new Map<string, string>()
+  const headers = new Map<string, Record<string, string>>()
   const agents: { uri: string }[] = []
   return {
     calls,
     bodies,
+    headers,
     agents,
     undici: {
       ProxyAgent: class {
@@ -28,9 +30,10 @@ function fakeTransport(script: Record<string, { status: number; body: string } |
         close() { return Promise.resolve() }
         destroy() { return Promise.resolve() }
       } as never,
-      request: (async (url: string, init?: { body?: string }) => {
+      request: (async (url: string, init?: { body?: string; headers?: Record<string, string> }) => {
         calls.push(url)
         if (typeof init?.body === 'string') bodies.set(url, init.body)
+        if (init?.headers) headers.set(url, init.headers)
         const entry = script[url] ?? script['*']
         if (entry instanceof Error) throw entry
         if (!entry) throw new Error(`unexpected request: ${url}`)
@@ -119,8 +122,8 @@ test('admission: fail-fast at each step (echo/geo/latency/models/smoke)', async 
   assert.ok(!result.admitted)
   assert.match(result.reason!, /zen smoke HTTP 403/)
 
-  // the smoke body must satisfy the free-lane agent-shape gate (2026-09-18):
-  // streaming + bash/read function tools, with the stubs call-disabled
+  // the smoke body must satisfy the free-lane gate (issue #56): streaming,
+  // bash+read stubs call-disabled, and a canonical ses_* session header
   const okTransport = fakeTransport(okScript())
   const okResult = await admitCandidate(deps(okTransport), { address: 'h:1', protocol: 'http', source: 'free' }, { timeoutMs: 1000 })
   assert.ok(okResult.admitted)
@@ -131,11 +134,10 @@ test('admission: fail-fast at each step (echo/geo/latency/models/smoke)', async 
   }
   assert.equal(smokeBody.stream, true)
   assert.equal(smokeBody.tool_choice, 'none')
-  assert.deepEqual(
-    smokeBody.tools?.map((t) => t.function.name).sort(),
-    ['bash', 'read'],
-    'smoke body carries the free-lane gate tools',
-  )
+  const smokeToolNames = smokeBody.tools?.map((t) => t.function.name) ?? []
+  assert.deepEqual([...smokeToolNames].sort(), ['bash', 'read'])
+  const smokeHeaders = okTransport.headers.get(CHAT_URL)!
+  assert.match(smokeHeaders['x-opencode-session'] ?? '', /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/, 'canonical session header')
 
   // transport errors surface as reasons (timeout / reset)
   transport = fakeTransport({ '*': new Error('connect ECONNREFUSED') })
@@ -166,6 +168,47 @@ test('admission: trusted sources are admitted with warnings even on failure', as
   assert.ok(warnings.some((line) => line.includes('leased:1')))
 })
 
+test('admission: scheme-carrying manual addresses build a valid agent URI (issue #44)', async () => {
+  // manual entries keep the scheme the UI asks for (http://host:port), and
+  // prefixing again yields http://http://host:port — InvalidArgumentError in
+  // every ProxyAgent, invisible because admitTrusted admits on failure with
+  // empty facts. Both the coarse-screen agent and the full-chain agent must
+  // keep the user's scheme.
+  const transport = fakeTransport(okScript())
+  const result = await admitCandidate(deps(transport), {
+    address: 'http://127.0.0.1:24021',
+    protocol: 'http',
+    source: 'manual',
+  })
+  assert.ok(result.admitted, result.reason)
+  assert.equal(result.node?.exitIP, '5.5.5.5')
+  assert.equal(transport.agents[0]?.uri, 'http://127.0.0.1:24021', 'coarse-screen agent must not double the scheme')
+  assert.ok(transport.agents.every((a) => a.uri === 'http://127.0.0.1:24021'))
+
+  // socks5 carries its scheme too, and a bare address still gains one
+  const socks = fakeTransport(okScript())
+  const socksResult = await admitCandidate(deps(socks), {
+    address: 'socks5://10.0.0.2:1080',
+    protocol: 'socks5',
+    source: 'manual',
+  })
+  assert.ok(socksResult.admitted, socksResult.reason)
+  assert.ok(socks.agents.every((a) => a.uri === 'socks5://10.0.0.2:1080'))
+})
+
+test('coarseScreen: scheme-carrying address keeps its scheme in the agent URI', async () => {
+  const transport = fakeTransport({ [ECHO_URL]: { status: 200, body: echoBody('5.5.5.5', 'US') } })
+  const verdict = await coarseScreen(deps(transport), { address: 'http://127.0.0.1:24001', protocol: 'http' })
+  assert.ok('exitIP' in verdict)
+  assert.equal(verdict.exitIP, '5.5.5.5')
+  assert.equal(transport.agents[0]?.uri, 'http://127.0.0.1:24001')
+
+  const bare = fakeTransport({ [ECHO_URL]: { status: 200, body: echoBody('5.5.5.5', 'US') } })
+  const bareVerdict = await coarseScreen(deps(bare), { address: '127.0.0.1:24001', protocol: 'http' })
+  assert.ok('exitIP' in bareVerdict)
+  assert.equal(bare.agents[0]?.uri, 'http://127.0.0.1:24001')
+})
+
 test('admission end-to-end: real undici.request through a real local proxy', async () => {
   // Load-bearing integration: admission's per-request ProxyAgent path works
   // against npm undici's request API (the seam verified in the IP-2 probe).
@@ -192,5 +235,15 @@ test('admission end-to-end: real undici.request through a real local proxy', asy
   assert.ok(proxied >= 3, 'admission chain did not ride the candidate proxy')
   assert.ok(result.admitted, result.reason)
   assert.equal(result.node?.exitIP, '5.5.5.5')
+
+  // issue #44 end-to-end: the scheme the card asks for must survive the real
+  // ProxyAgent too (undici throws InvalidArgumentError on http://http://...)
+  const withScheme = await admitCandidate(depsReal as never, {
+    address: `http://127.0.0.1:${port}`,
+    protocol: 'http',
+    source: 'manual',
+  })
+  assert.ok(withScheme.admitted, withScheme.reason)
+  assert.equal(withScheme.node?.exitIP, '5.5.5.5')
   await new Promise<void>((resolve) => server.close(() => resolve()))
 })

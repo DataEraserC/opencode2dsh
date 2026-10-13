@@ -24,6 +24,7 @@ import { canonicalSessionID, disguiseHeaders, opencodeUserAgent, randomID, stabl
 import { isLoopback } from './dispatcher.ts'
 import { laneNodeOf } from './lanes.ts'
 import { gradeOf, type ExitNode, type ExitPool } from './pool.ts'
+import { exitProxyUri } from './dispatcher.ts'
 
 export interface AdmissionDeps {
   pool: ExitPool
@@ -82,9 +83,10 @@ export async function coarseScreen(
 
   let agent: Dispatcher | null = null
   try {
-    agent = new deps.undici.ProxyAgent({
-      uri: candidate.protocol === 'socks5' ? `socks5://${candidate.address}` : `http://${candidate.address}`,
-    })
+    // exitProxyUri keeps a scheme the address already carries (issue #44):
+    // manual ids are parsed with their scheme, and `http://http://host:port`
+    // makes undici's ProxyAgent throw InvalidArgumentError.
+    agent = new deps.undici.ProxyAgent({ uri: exitProxyUri(candidate.address, candidate.protocol) })
   } catch (err) {
     return { rejected: `agent-build: ${err instanceof Error ? err.message : String(err)}` }
   }
@@ -239,9 +241,11 @@ export async function admitCandidate(
 
   let agent: Dispatcher | null = null
   try {
-    agent = new deps.undici.ProxyAgent({
-      uri: candidate.protocol === 'socks5' ? `socks5://${dialAddress}` : `http://${dialAddress}`,
-    })
+    // Dial the LANE's bound address (`dialAddress`): a `lane:` id carries no
+    // port, so `candidate.address` cannot be dialed. exitProxyUri supplies the
+    // scheme without doubling one the address already carries (issue #44:
+    // `http://http://host:port` makes ProxyAgent throw InvalidArgumentError).
+    agent = new deps.undici.ProxyAgent({ uri: exitProxyUri(dialAddress, candidate.protocol) })
   } catch (err) {
     laneRelease?.()
     return { admitted: false, reason: `agent-build: ${err instanceof Error ? err.message : String(err)}` }
@@ -279,15 +283,20 @@ export async function admitCandidate(
 
     // Step 4: anonymous-lane smoke (streaming, 1 token). The free lane
     // rejects non-streaming bodies outright and wants the agent-shape gate
-    // tools in the body (adapter/messages.ts, live-probed 2026-09-18) — a
-    // bare 1-token probe 403s like every toolless chat.
+    // tools in the body; since ~2026-10-09 (issue #56) it additionally
+    // requires a canonical ses_* session header — the same disguise the
+    // adapter sends on every chat request (adapter/ids.ts).
     const smoke = await request(`${zenBase.replace(/\/+$/, '')}/v1/chat/completions`, {
       method: 'POST',
       headers: {
         authorization: 'Bearer public',
         'content-type': 'application/json',
-        'user-agent': opencodeUserAgent(),
-        'x-opencode-client': 'cli',
+        ...disguiseHeaders({
+          session: canonicalSessionID('opencode2dsh:admission-smoke'),
+          request: randomID('req', 16),
+          project: stableID('prj', 'opencode2dsh:admission'),
+          parentSession: '',
+        }),
         ...probeHeaders,
       },
       body: JSON.stringify({
