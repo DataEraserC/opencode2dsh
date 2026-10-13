@@ -69,6 +69,10 @@ export function deriveRequestIDs(messages: Array<{ role: string; content: unknow
  * being sufficient (upstream fix: jasonxu114514/opencode2api 8185202).
  * Live-probed 2026-09-18: the gate has a second, body-shape half (streaming
  * + bash/read tools, adapter/messages.ts); both must pass.
+ *
+ * Since 2026-10-13 the gate also DECODES the 12-hex time field, which turned
+ * a digest-derived prefix into a 403 for every non-CLI client (issue #62);
+ * see sessionTimeField below.
  */
 const CANONICAL_SESSION_PATTERN = /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/
 
@@ -86,16 +90,61 @@ function base62Fixed(value: bigint, width: number): string {
 }
 
 /**
+ * The 12-hex time field OpenCode puts in front of every `ses_` id: the low 48
+ * bits of `~((Date.now() * 0x1000) + counter)`, big-endian
+ * (packages/schema/src/identifier.ts create(), descending branch). The counter
+ * disambiguates ids minted in the same millisecond and resets when the clock
+ * moves, exactly as upstream.
+ *
+ * The field used to be sha256 digest bytes, which decode to an arbitrary point
+ * in the 795-day 48-bit wrap — so the free-tier gate, which since 2026-10-13
+ * validates that the field names a plausible instant, rejected nearly every
+ * request with 403 FreeTierError (issue #62; same defect as
+ * decolua/9router#4780).
+ *
+ * Memoized per conversation. OpenCode mints a session id once and keeps it for
+ * the session's life, and our derived session must likewise not move between
+ * turns or upstream loses prompt-cache affinity and per-session quota
+ * continuity. Oldest-first eviction bounds the table; an evicted conversation
+ * that returns simply mints a fresh id.
+ */
+const SESSION_TIME_CACHE_LIMIT = 1024
+const sessionTimeFields = new Map<string, string>()
+let lastMintMs = 0
+let mintCounter = 0
+
+function sessionTimeField(conversationKey: string): string {
+  const cached = sessionTimeFields.get(conversationKey)
+  if (cached !== undefined) return cached
+  const timestamp = Date.now()
+  if (timestamp !== lastMintMs) {
+    lastMintMs = timestamp
+    mintCounter = 0
+  }
+  mintCounter++
+  const current = BigInt(timestamp) * 0x1000n + BigInt(mintCounter)
+  const field = ((~current) & 0xffffffffffffn).toString(16).padStart(12, '0')
+  if (sessionTimeFields.size >= SESSION_TIME_CACHE_LIMIT) {
+    const oldest = sessionTimeFields.keys().next().value
+    if (oldest !== undefined) sessionTimeFields.delete(oldest)
+  }
+  sessionTimeFields.set(conversationKey, field)
+  return field
+}
+
+/**
  * The session id sent upstream. A signal that already carries an official
  * OpenCode session passes through unchanged (preserving upstream prompt-cache
  * affinity); any other identity — the conversation seed in adapter mode,
  * foreign client sessions, admission probes — is deterministically hashed
  * into the canonical shape, so the same conversation keeps a stable session.
+ * The time field is minted from the clock (sessionTimeField), the random half
+ * from the digest.
  */
 export function canonicalSessionID(signal: string): string {
   if (CANONICAL_SESSION_PATTERN.test(signal)) return signal
   const sum = createHash('sha256').update('ses\x00' + signal).digest()
-  const timePart = sum.subarray(0, 6).toString('hex')
+  const timePart = sessionTimeField(sum.toString('hex'))
   const randomPart = base62Fixed(BigInt('0x' + sum.subarray(6, 16).toString('hex')), 14)
   return `ses_${timePart}${randomPart}`
 }

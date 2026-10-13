@@ -144,6 +144,20 @@ test('authentication failures retain AUTH when the upstream does not report a re
   }
 })
 
+test('a free-tier gate 403 keeps its own explanation instead of AUTH (issue #62)', async () => {
+  // Falling into AUTH made DSH replace this body with "API key is invalid",
+  // which is the symptom the reporter saw and not what upstream said.
+  const message = `OpenAI API error (403): {"type":"error","error":{"type":"FreeTierError","message":"OpenCode's free tier can only be used from within OpenCode. Download it at https://opencode.ai and keep building."}}`
+  const chunks = await collect([event({ stopReason: 'error', errorMessage: message })])
+  assert.deepEqual(failureOf(expectFinish(chunks[1])), { message, code: 'FREE_TIER_BLOCKED' })
+})
+
+test('a 403 without the free-tier marker still classifies as AUTH', async () => {
+  const message = 'OpenAI API error (403): {"error":{"code":"forbidden","message":"Forbidden"}}'
+  const chunks = await collect([event({ stopReason: 'error', errorMessage: message })])
+  assert.deepEqual(failureOf(expectFinish(chunks[1])), { message, code: 'AUTH' })
+})
+
 test('an empty completed response is an EMPTY_RESPONSE error', async () => {
   const chunks = await collect([event({ content: [] })])
   const failure = failureOf(expectFinish(chunks[1]))

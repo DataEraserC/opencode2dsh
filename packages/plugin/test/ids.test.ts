@@ -33,14 +33,36 @@ test('canonicalSessionID passes official sessions through unchanged', () => {
 })
 
 test('canonicalSessionID hashes foreign ids into the canonical shape', () => {
-  // Regression vectors computed independently of the implementation
-  // (sha256("ses\0"+signal): 6B hex + 10B big-endian base62, width 14).
-  assert.equal(canonicalSessionID('"hello"'), 'ses_5158bbbedb260ySUUEO3741Ult')
-  assert.equal(canonicalSessionID('admission:1.2.3.4:8080'), 'ses_a226427749f939B83lyhD6aJHb')
+  // The digest half is unchanged (sha256("ses\0"+signal): 10B big-endian
+  // base62, width 14); `slice(16)` skips "ses_" and the 12-hex time field,
+  // which is now clock-derived and asserted by its own test below.
+  assert.equal(canonicalSessionID('"hello"').slice(16), '0ySUUEO3741Ult')
+  assert.equal(canonicalSessionID('admission:1.2.3.4:8080').slice(16), '39B83lyhD6aJHb')
   // deterministic: same conversation keeps a stable session
   assert.equal(canonicalSessionID('anything'), canonicalSessionID('anything'))
   // distinct identities stay distinct
   assert.notEqual(canonicalSessionID('a'), canonicalSessionID('b'))
+})
+
+/** The millisecond instant OpenCode's 12-hex `ses_` time field encodes. */
+function sessionTimeMillis(session: string): number {
+  return Number((~BigInt('0x' + session.slice(4, 16)) & 0xffffffffffffn) >> 12n)
+}
+
+test('canonicalSessionID stamps a decodable OpenCode timestamp (issue #62)', () => {
+  // The free-tier gate decodes this field and refuses an implausible instant.
+  // The old digest-derived prefix decoded to an arbitrary point in the 795-day
+  // 48-bit wrap, so nearly every request drew 403 FreeTierError.
+  const session = canonicalSessionID('issue-62-timestamp-probe')
+  assert.match(session, /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/)
+  const wrap = 2 ** 36
+  const stamp = sessionTimeMillis(session)
+  const now = Date.now() % wrap
+  const distance = Math.min(Math.abs(stamp - now), wrap - Math.abs(stamp - now))
+  assert.ok(distance < 60_000, `time field decodes to ${stamp}, expected ~${now}`)
+  // frozen per conversation: a repeat call must not move the id upstream
+  // (prompt-cache affinity and per-session quota depend on it)
+  assert.equal(canonicalSessionID('issue-62-timestamp-probe'), session)
 })
 
 test('deriveRequestIDs emits canonical-shape sessions', () => {
