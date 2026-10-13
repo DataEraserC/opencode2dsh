@@ -142,6 +142,7 @@ The plugin writes a health snapshot after every refresh round:
 
 | Symptom | Likely cause & fix |
 | --- | --- |
+| `403 FreeTierError` / "OpenCode's free tier can only be used from within OpenCode" | The upstream restricts free-tier clients. The plugin preserves the explanation instead of reporting an invalid API key. Use the supported OpenCode client or an official API service. |
 | Boot screen shows `Failed to load plugins … list slot "plugins.item" requires options.id`, or the IP 池 entry has no configuration page | Your DSH predates the 0.1.7 Plugins page contract. Upgrade DSH to 0.1.7 (latest recommended). On 0.1.6 and older the page never mounts (it is gated on `configForms.whileServed`) — model routing is unaffected. |
 | DSH 0.1.7/0.2 cannot start after plugin installation (`pending … settingsScope`) | Upgrade the plugin to 0.3.5. On DSH 0.2, configure IP pooling through the installed opencode2dsh row on the Plugins page. |
 | Only 3 models | Startup fetch raced your network; retries land within ~1 min. Check `adapter-status.json` for `lastError`. |

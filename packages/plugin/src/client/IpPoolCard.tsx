@@ -26,6 +26,12 @@ import type { ConfigFormSnapshot } from '@deepseek-ai/dsh-client-ui-settings/cli
 import type { en } from './locales.ts'
 import { diffWrites, splitCsv } from './ip-pool-diff.ts'
 import styles from './ip-pool.module.css'
+import { poolWriteOps } from './settings-writes.ts'
+// Dependency-free (and so safe for the browser bundle): the shared
+// subscription-URL precedence rule, also used by the host resolver.
+import { resolveSubscriptionUrls } from '../ip-pool-settings/subscription-urls.ts'
+import { DEFAULT_SUBSCRIPTION_USER_AGENT } from '../pool/subscription-defaults.ts'
+import { postBridgeAction, type BridgeAction } from './bridge-action.ts'
 
 /** The reactive values and commands the Plugins page supplies for this page. */
 export interface ConfigPageForm {
@@ -70,7 +76,7 @@ export interface IpPoolSettingsValue {
   maxConcurrentProbes: number
   free: { enabled: boolean; targetSize: number; blockedCountries: string[] }
   manual: string[]
-  subscription: { urls: string[]; refreshMs: number }
+  subscription: { urls: string[]; refreshMs: number; userAgent: string }
   /** Previous composition spelling, migrated on a subscription edit. */
   subscriptions?: string[]
   singbox: { path: string; idleStopMs: number; lanes: number }
@@ -115,7 +121,7 @@ export interface PoolStatusView {
     admitted: number; rejected: number; fetched: number; coarsePassed: number; state: string; at: number
     progress: { running: boolean; stage: 'fetch' | 'coarse' | 'admit' | 'idle'; sourcesDone: number; sourcesTotal: number; fetched: number; candidates: number; coarsePassed: number; coarseDone: number; admissions: number; admitted: number }
   } | null
-  subscription: { urlCount: number; pendingConversion: number; convertedAdmitted: number; plaintextAdmitted: number; lastFetch: number; lastError: string } | null
+  subscription: { running: boolean; urlCount: number; pendingConversion: number; convertedAdmitted: number; plaintextAdmitted: number; lastFetch: number; lastError: string } | null
   at: number
 }
 
@@ -136,7 +142,7 @@ const DEFAULTS: IpPoolSettingsValue = {
   maxConcurrentProbes: 3,
   free: { enabled: true, targetSize: 20, blockedCountries: ['CN'] },
   manual: [],
-  subscription: { urls: [], refreshMs: 30 * 60_000 },
+  subscription: { urls: [], refreshMs: 30 * 60_000, userAgent: DEFAULT_SUBSCRIPTION_USER_AGENT },
   singbox: { path: 'sing-box', idleStopMs: 600_000, lanes: 16 },
   pinnedExitId: '',
   pinnedStrict: false,
@@ -159,6 +165,7 @@ export interface FormState {
   manual: string[]
   subscriptionUrls: string[]
   refreshMs: string
+  userAgent: string
   singboxPath: string
   singboxIdleStopMs: string
   singboxLanes: string
@@ -177,6 +184,7 @@ function emptyForm(): FormState {
     manual: [],
     subscriptionUrls: [],
     refreshMs: String(DEFAULTS.subscription.refreshMs),
+    userAgent: DEFAULTS.subscription.userAgent,
     singboxPath: DEFAULTS.singbox.path,
     singboxIdleStopMs: String(DEFAULTS.singbox.idleStopMs),
     singboxLanes: String(DEFAULTS.singbox.lanes),
@@ -196,6 +204,7 @@ function formFromValue(value: IpPoolSettingsValue): FormState {
     manual: [...value.manual],
     subscriptionUrls: [...value.subscription.urls],
     refreshMs: String(value.subscription.refreshMs),
+    userAgent: value.subscription.userAgent,
     singboxPath: value.singbox.path,
     singboxIdleStopMs: String(value.singbox.idleStopMs),
     singboxLanes: String(value.singbox.lanes),
@@ -218,7 +227,18 @@ interface ServedEntry {
  */
 function servedSection(state: ConfigFormSnapshot<Record<string, unknown>> | undefined): IpPoolSettingsValue {
   const served = (state?.value as ServedEntry | undefined)?.ipPool
-  return { ...DEFAULTS, ...(served ?? {}), ...(served?.free ? { free: { ...DEFAULTS.free, ...served.free } } : {}), ...(served?.subscription ? { subscription: { ...DEFAULTS.subscription, ...served.subscription } } : {}), ...(served?.singbox ? { singbox: { ...DEFAULTS.singbox, ...served.singbox } } : {}) } as IpPoolSettingsValue
+  return {
+    ...DEFAULTS, ...served,
+    free: { ...DEFAULTS.free, ...served?.free },
+    // `subscription.urls` is canonical and the legacy flat `subscriptions` is
+    // only a fallback: the shared resolver picks whichever actually carries
+    // URLs. Spreading the flat key on a plain `!== undefined` check would
+    // clobber the nested field with the `[]` schemastery injects into every
+    // `Schema.array()` — which is what made a freshly saved URL render as an
+    // empty list. See subscription-urls.ts.
+    subscription: { ...DEFAULTS.subscription, ...served?.subscription, urls: resolveSubscriptionUrls(served) },
+    singbox: { ...DEFAULTS.singbox, ...served?.singbox },
+  }
 }
 
 /** One-line live refill progress: stage + counters (docs §5.3). */
@@ -573,6 +593,7 @@ function CardBody(props: { settings: ConfigPageForm | undefined; t: IpPoolCardPr
   // Poll the bridge /status: 1s while probing or refilling, 3s otherwise (docs §5.3).
   const probing = status !== null && status.prober.queued + status.prober.inFlight > 0
   const refilling = status?.refill?.progress.running === true
+  const refreshingSubscriptions = status?.subscription?.running === true
   const refreshStatus = useCallback(async (): Promise<void> => {
     try {
       const response = await fetch(`${BRIDGE_PREFIX}/status`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
@@ -590,9 +611,9 @@ function CardBody(props: { settings: ConfigPageForm | undefined; t: IpPoolCardPr
   useEffect(() => {
     if (snapshot?.status !== 'ready' || !hydratedRef.current || !form.enabled) return
     void refreshStatus()
-    const interval = setInterval(() => void refreshStatus(), probing || refilling ? 1_000 : 3_000)
+    const interval = setInterval(() => void refreshStatus(), probing || refilling || refreshingSubscriptions ? 1_000 : 3_000)
     return () => clearInterval(interval)
-  }, [snapshot?.status, form.enabled, probing, refilling, refreshStatus, hydratedRef.current]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [snapshot?.status, form.enabled, probing, refilling, refreshingSubscriptions, refreshStatus, hydratedRef.current]) // eslint-disable-line react-hooks/exhaustive-deps
 
   if (snapshot?.status === 'loading') {
     return <p className={styles.status}>{t('statusLoading')}</p>
@@ -645,7 +666,7 @@ function CardBody(props: { settings: ConfigPageForm | undefined; t: IpPoolCardPr
     setError(null)
     try {
       const ok = await settings.mutate(
-        writes.map((write) => ({ op: write.op, path: [IP_POOL_FIELD, write.field], value: write.value }) as ConfigPathOp),
+        poolWriteOps(writes),
         snapshot.revision,
       )
       setSaved(ok)
@@ -674,14 +695,14 @@ function CardBody(props: { settings: ConfigPageForm | undefined; t: IpPoolCardPr
     failed: error !== null,
   }
 
-  /** One bridge action (/probe). */
-  const bridgeAction = async (body: { scope: 'all' | 'refill' } | { scope: 'exit'; exitId: string }): Promise<void> => {
+  /** One bridge action (/probe): probe lanes, or the subscription refresh. */
+  const bridgeAction = async (body: BridgeAction): Promise<void> => {
     setActionBusy(true)
     try {
-      await fetch(`${BRIDGE_PREFIX}/probe`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
+      await postBridgeAction(body)
       await refreshStatus()
-    } catch {
-      setStatusError(t('refreshError'))
+    } catch (err) {
+      setStatusError(err instanceof Error ? err.message : t('refreshError'))
     } finally {
       setActionBusy(false)
     }
@@ -820,12 +841,21 @@ function CardBody(props: { settings: ConfigPageForm | undefined; t: IpPoolCardPr
               type="button"
               className={styles.ghostButton}
               data-testid="refresh-subscriptions"
-              disabled={actionBusy || !form.enabled}
-              onClick={() => { void bridgeAction({ scope: 'refill' }) }}
+              disabled={actionBusy || refreshingSubscriptions || !form.enabled || served.subscription.urls.length === 0}
+              onClick={() => { void bridgeAction({ scope: 'subscriptions' }) }}
             >
-              {t('subscriptionRefreshNow')}
+              {t(refreshingSubscriptions || actionBusy ? 'statusLoading' : 'subscriptionRefreshNow')}
             </button>
           </div>
+        </div>
+        <div className={styles.fieldRow}>
+          <TextField
+            label={t('subscriptionUserAgent')}
+            hint={t('subscriptionUserAgentHint')}
+            value={form.userAgent}
+            testId="field-subscriptionUserAgent"
+            onChange={(value) => { setSaved(false); setForm({ ...form, userAgent: value }) }}
+          />
         </div>
         {status?.subscription !== null && status?.subscription !== undefined && (
           <span className={styles.status}>

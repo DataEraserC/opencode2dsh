@@ -107,7 +107,9 @@ DSH                opencode2dsh-agent (Go)                opencode.ai/zen
  │                       │ Accept: application/json, text/event-stream
  │                       │ User-Agent: opencode/1.18.31 (<goos> <goarch>; <goversion>)
  │                       │ x-opencode-client: cli
- │                       │ x-opencode-session: ses_<12hex+14base62> ← 规范格式
+  │                       │ x-opencode-session: ses_<12hex+14base62> ← 规范格式
+  │                       │   12hex = ~(Date.now()*0x1000 + counter) ← 真实时钟（#62）
+  │                       │   14base62 = sha256("ses\0"+signal) 派生（会话亲和）
  │                       │ x-session-affinity: <同上>
  │                       │ X-Session-Id: <同上>
  │                       │ x-opencode-request: req_<32hex>

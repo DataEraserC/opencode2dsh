@@ -7,6 +7,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { diffWrites } from '../src/client/ip-pool-diff.ts'
+import { DEFAULT_SUBSCRIPTION_USER_AGENT } from '../src/pool/subscription-defaults.ts'
 import type { FormState, IpPoolSettingsValue } from '../src/client/IpPoolCard.tsx'
 
 /** A served value with defaults filled, as servedSection() renders it. */
@@ -17,7 +18,7 @@ function served(over: Partial<IpPoolSettingsValue> = {}): IpPoolSettingsValue {
     maxConcurrentProbes: 3,
     free: { enabled: true, targetSize: 20, blockedCountries: ['CN'] },
     manual: [],
-    subscription: { urls: [], refreshMs: 30 * 60_000 },
+    subscription: { urls: [], refreshMs: 30 * 60_000, userAgent: DEFAULT_SUBSCRIPTION_USER_AGENT },
     singbox: { path: 'sing-box', idleStopMs: 600_000, lanes: 16 },
     pinnedExitId: '',
     pinnedStrict: false,
@@ -36,6 +37,7 @@ function form(over: Partial<FormState> = {}): FormState {
     manual: [],
     subscriptionUrls: [],
     refreshMs: String(30 * 60_000),
+    userAgent: DEFAULT_SUBSCRIPTION_USER_AGENT,
     singboxPath: 'sing-box',
     singboxIdleStopMs: '600000',
     singboxLanes: '16',
@@ -84,4 +86,22 @@ test('the off flip and an idle edit land as ordered writes', () => {
     { field: 'enabled', op: 'set', value: false },
     { field: 'singbox', op: 'set', value: { path: 'sing-box', idleStopMs: 300_000, lanes: 16 } },
   ])
+})
+
+test('a URL edit carries the fetch User-Agent (a set replaces the whole node)', () => {
+  const writes = diffWrites(form({ subscriptionUrls: ['https://sub.example.com/token'] }), served())
+  assert.deepEqual(writes, [{
+    field: 'subscription',
+    op: 'set',
+    value: { urls: ['https://sub.example.com/token'], refreshMs: 30 * 60_000, userAgent: DEFAULT_SUBSCRIPTION_USER_AGENT },
+  }])
+})
+
+test('a blank User-Agent falls back to the default instead of clearing the field', () => {
+  const writes = diffWrites(form({ subscriptionUrls: ['https://sub.example.com/token'], userAgent: '   ' }), served())
+  assert.deepEqual(writes, [{
+    field: 'subscription',
+    op: 'set',
+    value: { urls: ['https://sub.example.com/token'], refreshMs: 30 * 60_000, userAgent: DEFAULT_SUBSCRIPTION_USER_AGENT },
+  }])
 })

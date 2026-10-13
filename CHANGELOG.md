@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Free-lane chats stop failing with `API 密钥无效` / `403 FreeTierError` (#62). The synthesized session id was **shape**-correct but **derivation**-wrong: `canonicalSessionID()` filled the 12 hex characters of its `ses_` id with `sha256("ses\0" + signal)`, and upstream reads those characters as a wall clock. Since ~2026-10-13 the free tier decodes that segment and rejects anything that is not a real timestamp, so every request was refused even though the id matched the canonical regex — which is why the existing shape assertion kept passing while nothing worked. Those characters now come from upstream's own generator (`packages/schema/src/identifier.ts`): `~(Date.now() * 0x1000 + counter)`, with `counter` pinned at 1. Because the bitwise inversion flips the counter, real ids end their time segment in `ffe` — a structural consequence, not a marker, and the string-level tell that separates a genuine id from a digest. The conversation identity still comes from the digest, but only for the 14-character Base62 tail, so distinct conversations cannot collide and prompt-cache affinity survives. Sessions are memoized per conversation so a retry or a later turn reuses one id: re-reading a live clock per request would hand the free tier a new session every call and forfeit the cache affinity #56 established. Official `ses_` ids arriving from a real OpenCode client still pass through untouched.
+- The model picker now refreshes when the live catalog or its capabilities change, including a Zen response arriving after the 4-second startup window (#59). Failed cold fetches expose an empty catalog with `error` status; a failed refresh of a populated catalog retains its last roster with `stale` status.
+- The subscription Refresh now button now drives `scope: 'subscriptions'` (#63), waits for an ongoing round, and shows progress and upstream errors. Clearing URLs or disabling the pool stops the old fetcher. The configurable subscription User-Agent default is shared by host and browser.
+- Upstream `403 FreeTierError` now retains its client restriction explanation as `FREE_TIER_RESTRICTED` instead of appearing as an invalid API key (#62). This failure remains non-retryable.
+- Saved subscription URLs reach the runtime and remain visible when reopening settings (#60). Host and client share nested/legacy URL resolution, handling schema-injected empty arrays without hiding the saved value.
+- Subscription User-Agent is configurable through `ipPool.subscription.userAgent`, applied on the next refresh. Empty values restore `clash-verge/v2.0`; the host and browser share one default and normalization rule (#60).
+
 ## 0.3.11 (2026-10-11)
 
 ### Fixed

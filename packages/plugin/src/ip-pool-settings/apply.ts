@@ -157,6 +157,7 @@ export function applyIpPoolSettings(
           // and every host actually routed direct).
           const live = controller.runtime?.installer?.proxyHosts
           return {
+            enabled: controller.settings().enabled,
             pinnedStrict: controller.settings().pinnedStrict,
             proxyHosts: live
               ? [...live]

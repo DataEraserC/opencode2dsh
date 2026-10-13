@@ -352,19 +352,40 @@ test('ModelCatalog intersects the live catalog with free decisions', async () =>
   }
 })
 
-test('ModelCatalog falls back to static ids while the live catalog is pending', async () => {
+test('ModelCatalog stops advertising bootstrap ids after a failed live fetch', async () => {
   const fail = (async () => {
     throw new Error('network down')
   }) as typeof fetch
   const catalog = new ModelCatalog({ fetchImpl: fail })
   await catalog.refreshOnce()
-  assert.deepEqual(catalog.list(), bootstrapList)
+  assert.deepEqual(catalog.list(), [])
   // static ids are verified upstream: allowed even without metadata
   assert.equal(catalog.decision('big-pickle').allowed, true)
   assert.equal(catalog.decision('big-pickle').source, 'static_verified')
   assert.equal(catalog.decision('unknown-model').allowed, false)
-  assert.equal(catalog.snapshot().status, 'pending')
+  assert.equal(catalog.snapshot().status, 'error')
   catalog.stop()
+})
+
+test('a failed cold fetch recovers, and a later failure retains the last live roster as stale', async () => {
+  let failZen = true
+  const catalog = new ModelCatalog({ fetchImpl: (async (url: string | URL) => {
+    if (String(url).includes('/v1/models') && failZen) throw new Error('Zen unavailable')
+    return Response.json(String(url).includes('/v1/models') ? zenBody : metadataBody)
+  }) as typeof fetch })
+  try {
+    await catalog.refreshOnce()
+    assert.deepEqual(catalog.list(), [])
+    assert.equal(catalog.snapshot().status, 'error')
+    failZen = false
+    await catalog.refreshOnce()
+    assert.deepEqual(catalog.list(), ['qwen-free'])
+    assert.equal(catalog.snapshot().status, 'ready')
+    failZen = true
+    await catalog.refreshOnce()
+    assert.deepEqual(catalog.list(), ['qwen-free'])
+    assert.equal(catalog.snapshot().status, 'stale')
+  } finally { catalog.stop() }
 })
 
 test('warm() waits for the first live fetch so a list() read is never the bootstrap list (issue #45)', async () => {
@@ -423,8 +444,8 @@ test('warm() is bounded: a dead network answers with the static list, a slow one
   const dead = new ModelCatalog({ fetchImpl: fail })
   try {
     await dead.warm(2_000)
-    assert.deepEqual(dead.list(), bootstrapList)
-    assert.equal(dead.snapshot().status, 'pending')
+    assert.deepEqual(dead.list(), [])
+    assert.equal(dead.snapshot().status, 'error')
   } finally {
     dead.stop()
   }
@@ -451,16 +472,16 @@ test('S3 vouch survives a stale deprecated flag but not a paid verdict', async (
   // upstream — a compile-time verified id keeps its vouch until delisted.
   const deprecatedFlagged = new ModelCatalog({
     fetchImpl: fakeFetch({
-      'https://opencode.ai/zen/v1/models': { data: [{ id: 'mimo-v2.5-free' }] },
+      'https://opencode.ai/zen/v1/models': { data: [{ id: 'mimo-v2.6-flash-free' }] },
       'https://models.dev/api.json': {
-        opencode: { models: { 'mimo-v2.5-free': { status: 'deprecated', cost: { input: 0, output: 0 } } } },
+        opencode: { models: { 'mimo-v2.6-flash-free': { status: 'deprecated', cost: { input: 0, output: 0 } } } },
       },
     }),
   })
   try {
     await deprecatedFlagged.refreshOnce()
-    assert.equal(deprecatedFlagged.decision('mimo-v2.5-free').allowed, true)
-    assert.equal(deprecatedFlagged.decision('mimo-v2.5-free').source, 'static_verified')
+    assert.equal(deprecatedFlagged.decision('mimo-v2.6-flash-free').allowed, true)
+    assert.equal(deprecatedFlagged.decision('mimo-v2.6-flash-free').source, 'static_verified')
   } finally {
     deprecatedFlagged.stop()
   }

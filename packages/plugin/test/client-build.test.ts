@@ -61,8 +61,12 @@ test('client reads and writes settings through the page-supplied ConfigPageForm'
   assert.ok(/state\.status/.test(source) || /status === "ready"/.test(source), 'reads the served form state')
   assert.ok(source.includes('.mutate('), 'writes through mutate(ops, revision)')
   // The served value is the whole entry: the editable section is the `ipPool`
-  // volatile node, so every write path keeps that field in front.
-  assert.ok(/\[\s*IP_POOL_FIELD\s*,\s*write\.field\s*\]/.test(source), 'write paths nest under the ipPool field')
+  // volatile node, so every write path keeps that field in front. Field writes
+  // go through settings-writes.ts `poolWriteOps`, which also drops the legacy
+  // flat `subscriptions` alias on a subscription edit (a cleared URL list must
+  // not resurface from it).
+  assert.ok(/\[\s*"ipPool"\s*,\s*write\.field\s*\]/.test(source), 'write paths nest under the ipPool field')
+  assert.ok(/\[\s*"ipPool"\s*,\s*"subscriptions"\s*\]/.test(source), 'a subscription edit also clears the legacy flat alias')
   assert.ok(/\[\s*IP_POOL_FIELD\s*,\s*"pinnedExitId"\s*\]/.test(source), 'pinned-exit write nests under ipPool too')
   // The save control belongs to the shared form chrome, not this page.
   assert.ok(source.includes('SettingsForm'), 'the page renders inside the shared form chrome')
@@ -87,6 +91,25 @@ test('client externals stay inside the host platform table', () => {
       `bundle requires "${specifier}" which is not in the host module table — it would miss at runtime`,
     )
   }
+})
+
+test('subscription refresh button drives its own bridge lane, not the free-source one', () => {
+  const stripped = code(bundle())
+  // 立即刷新 and 立即补充 are different actions: refill pulls the public
+  // free-proxy sources, subscriptions re-fetches the configured subscription
+  // URLs. The card shipped both buttons wired to { scope: 'refill' }, which
+  // left `refreshSubscriptions()` unreachable and made 立即刷新 a no-op.
+  // Pin the two scopes on the built artifact so the lanes cannot silently
+  // collapse back into one. (The bundler re-quotes string literals, so match
+  // on the scope value rather than on its quoting.)
+  const scopeLiteral = (name: string): RegExp => new RegExp(`scope:\\s*['"]${name}['"]`)
+  assert.match(stripped, scopeLiteral('subscriptions'), '立即刷新 sends the subscriptions scope')
+  assert.match(stripped, scopeLiteral('refill'), '立即补充 keeps sending the refill scope')
+  assert.doesNotMatch(
+    stripped,
+    /refresh-subscriptions[\s\S]{0,240}?scope:\s*['"]refill['"]/,
+    '立即刷新 must not send the free-source refill scope',
+  )
 })
 
 test('client manifest is declared in package.json', () => {

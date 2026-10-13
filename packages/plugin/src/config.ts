@@ -79,8 +79,9 @@ export interface IpPoolConfig {
   }
   /** Airport/Clash subscriptions (docs 1.2 source 3, IP-3). */
   subscriptions?: string[]
-  /** Subscription refresh interval ms (docs 4.6, default 30min). */
-  subscription?: { refreshMs?: number }
+  /** Subscription refresh interval ms (docs 4.6, default 30min) and the fetch
+   *  User-Agent (airports gate on it; empty = built-in default). */
+  subscription?: { refreshMs?: number; userAgent?: string }
   /** Cross-exit probe concurrency cap (docs 4.1; same-exit always serial). */
   maxConcurrentProbes?: number
   /** sing-box conversion core for encrypted nodes (docs 1.2.2, IP-4). */

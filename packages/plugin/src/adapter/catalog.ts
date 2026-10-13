@@ -34,15 +34,12 @@ export const FREE_LANE_BLOCKLIST: ReadonlySet<string> = new Set([
   'muse-spark-1.3-contributor-free',
 ])
 
-/** Verified against the anonymous lane with a real chat (agent/internal/catalog/static_models.go). */
+/** Previously verified models still in the public roster (checked 2026-10-13).
+ * New ids arrive through the live directory, which republishes the picker. */
 export const staticFreeModels: string[] = [
   'big-pickle', // verified 2026-08-28: anonymous chat 200 (non-stream + stream)
-  'mimo-v2.5-free', // verified 2026-08-28: anonymous chat 200 (non-stream); models.dev deprecated since 2026-10-03, still answers
   'mimo-v2.6-flash-free', // verified 2026-10-03: anonymous chat 200 (stream, adapter path); successor of mimo-v2.5-free
-  'ling-3.0-flash-fin-free', // verified 2026-09-01: anonymous chat 200
   'nemotron-3.5-lightning-free', // verified 2026-09-01: anonymous chat 200
-  'nemotron-3-ultra-free', // verified 2026-09-01: anonymous chat 200 (7s, earlier timeout was transient)
-  'muse-spark-1.2-contributor-free', // verified 2026-09-01: listed free in docs pricing; 403 region-blocked from our probe, region restriction accepted as non-fatal
 ]
 
 /** Exposed by /v1/models but without a verified anonymous chat yet. */
@@ -274,6 +271,7 @@ export class ModelCatalog {
   #prices: Map<string, ModelPrice> = new Map()
   #pricesReady = false
   #lastError = ''
+  #zenFailed = false
   #refreshSeconds: number
   #cachePath?: string
   #zenBaseUrl: string
@@ -354,9 +352,11 @@ export class ModelCatalog {
     try {
       const ids = await fetchZenModels(this.#zenBaseUrl, this.#fetch, opencodeUserAgent())
       this.#zen = new Set(ids)
+      this.#zenFailed = false
       this.#updatedAt = this.#now()
       this.#lastError = ''
     } catch (err) {
+      this.#zenFailed = true
       this.#lastError = err instanceof Error ? err.message : String(err)
     }
   }
@@ -412,11 +412,16 @@ export class ModelCatalog {
    */
   async warm(ms = 4_000): Promise<void> {
     if (this.#zen.size > 0 || this.#stopped) return
+    let timer: NodeJS.Timeout | undefined
     const timeout = new Promise<void>((resolve) => {
-      const timer = setTimeout(resolve, ms)
+      timer = setTimeout(resolve, ms)
       timer.unref?.()
     })
-    await Promise.race([this.refreshOnce().catch(() => {}), timeout])
+    try {
+      await Promise.race([this.refreshOnce().catch(() => {}), timeout])
+    } finally {
+      clearTimeout(timer)
+    }
   }
 
   decision(model: string): AnonymousDecision {
@@ -441,7 +446,7 @@ export class ModelCatalog {
 
   /** ids exposed to DSH: S1 ∩ allowed, or S3 while the live catalog is pending. */
   list(): string[] {
-    if (this.#zen.size === 0) return staticFreeModels.filter((model) => !FREE_LANE_BLOCKLIST.has(model))
+    if (this.#zen.size === 0) return this.#zenFailed ? [] : staticFreeModels.filter((model) => !FREE_LANE_BLOCKLIST.has(model))
     const out: string[] = []
     for (const model of this.#zen) {
       if (this.decision(model).allowed) out.push(model)
@@ -493,7 +498,7 @@ export class ModelCatalog {
     const age = this.#updatedAt === 0 ? Infinity : this.#now() - this.#updatedAt
     const stale = this.#updatedAt !== 0 && age > 10 * 60 * 1000
     return {
-      status: this.#updatedAt === 0 ? 'pending' : stale ? 'stale' : 'ready',
+      status: this.#updatedAt === 0 ? (this.#zenFailed ? 'error' : 'pending') : this.#zenFailed || stale ? 'stale' : 'ready',
       total: this.#zen.size,
       exposed: this.list().length,
       ...(this.#updatedAt !== 0 ? { lastRefresh: new Date(this.#updatedAt).toISOString() } : {}),

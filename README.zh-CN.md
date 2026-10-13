@@ -133,6 +133,7 @@ https://opencode.ai/zen/v1        ← Authorization: Bearer public
 
 | 现象 | 可能原因与处理 |
 | --- | --- |
+| `403 FreeTierError` / "OpenCode's free tier can only be used from within OpenCode" | 上游限制免费通道的客户端，插件会保留该说明；这不是个人 API 密钥错误。请使用上游支持的 OpenCode 客户端或正式 API 服务。 |
 | 启动页报 `Failed to load plugins … list slot "plugins.item" requires options.id`，或 IP 池条目没有配置页 | DSH 早于 0.1.7 的插件页契约。升级 DSH 到 0.1.7（推荐最新）；页面挂载门控是 `configForms.whileServed`，0.1.6 及更早上整页不出现，模型路由不受影响。 |
 | 安装插件后 DSH 0.1.7/0.2 无法启动，报 `pending … settingsScope` | 更新插件到 0.3.5；DSH 0.2 的 IP 池设置在插件页的 opencode2dsh 条目里。 |
 | 只有 3 个模型 | 启动时网络未就绪，重试会在约 1 分钟内补齐；看 `adapter-status.json` 里的 `lastError`。 |

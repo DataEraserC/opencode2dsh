@@ -60,6 +60,7 @@ export interface RefillView {
 }
 
 export interface SubscriptionView {
+  running: boolean
   /** URL count only — the URLs themselves never ride the bridge (§5.1 redaction). */
   urlCount: number
   pendingConversion: number
@@ -150,6 +151,7 @@ export function buildStatusView(
     subscription: runtime?.subscriptions
       ? {
         urlCount: runtime.subscriptions.urlCount,
+        running: runtime.subscriptions.state.running,
         pendingConversion: runtime.subscriptions.state.pendingConversion.length,
         convertedAdmitted: runtime.subscriptions.state.convertedAdmitted,
         plaintextAdmitted: runtime.subscriptions.state.plaintextAdmitted,
@@ -255,6 +257,9 @@ export type BridgeResult = { ok: true; value: unknown } | { ok: false; code: str
 /** deps over the live runtime + the current settings value (probe model etc.). */
 export interface BridgeHandlers {
   status(): Promise<BridgeResult>
+  /** Probe/refresh actions (docs §5.3): `all` = probe every exit, `exit` = probe
+   *  one, `refill` = one free-source refill round, `subscriptions` = one
+   *  subscription fetch+convert round (the card's 立即刷新). */
   probe(body: { scope?: unknown; exitId?: unknown }): Promise<BridgeResult>
   /** Selectable probe models (docs §5.2 探活模型 dropdown): S3 static list
    *  first, then the live Zen catalog entries the runtime resolved. */
@@ -268,7 +273,7 @@ export type ListLiveModels = () => string[]
 /** Build the bridge handlers over the runtime + current settings. */
 export function makeBridgeHandlers(
   runtime: () => IpPoolRuntime | null,
-  settings: () => { pinnedStrict: boolean; proxyHosts: string[] },
+  settings: () => { enabled?: boolean; pinnedStrict: boolean; proxyHosts: string[] },
   deps: { listLiveModels?: ListLiveModels } = {},
 ): BridgeHandlers {
   return {
@@ -280,7 +285,7 @@ export function makeBridgeHandlers(
     },
     async probe(body) {
       const rt = runtime()
-      if (rt === null) return { ok: false, code: 'pool-disabled', message: 'ip pool is not running (enabled off)' }
+      if (rt === null || settings().enabled === false) return { ok: false, code: 'pool-disabled', message: 'ip pool is not running (enabled off)' }
       const scope = body.scope
       if (scope === 'all') {
         const queued = await rt.probeAll()
@@ -290,13 +295,28 @@ export function makeBridgeHandlers(
         await rt.refillNow()
         return { ok: true, value: { refilled: true } }
       }
+      // The subscription lane the settings card's 立即刷新 button drives. It is
+      // deliberately distinct from 'refill', which pulls the public free-proxy
+      // sources: this one re-fetches ONLY the configured subscription URLs and
+      // converts their encrypted nodes through sing-box (docs §5.2).
+      if (scope === 'subscriptions') {
+        const subscriptions = rt.subscriptions
+        if (subscriptions === null || subscriptions.urlCount === 0) {
+          return { ok: false, code: 'no-subscriptions', message: 'no subscription URLs are configured' }
+        }
+        await rt.refreshSubscriptions()
+        if (subscriptions.state.lastError) {
+          return { ok: false, code: 'subscription-refresh-failed', message: subscriptions.state.lastError }
+        }
+        return { ok: true, value: { refreshed: true, urlCount: subscriptions.urlCount } }
+      }
       if (scope === 'exit') {
         const exitId = typeof body.exitId === 'string' ? body.exitId : ''
         if (!rt.pool.has(exitId)) return { ok: false, code: 'unknown-exit', message: `exit "${exitId}" is not in the pool` }
         const count = await rt.probeExit(exitId)
         return { ok: true, value: { queued: count } }
       }
-      return { ok: false, code: 'settings-rejected', message: "probe scope must be 'all', 'exit' or 'refill'" }
+      return { ok: false, code: 'settings-rejected', message: "probe scope must be 'all', 'exit', 'refill' or 'subscriptions'" }
     },
     async models() {
       const { staticFreeModels } = await import('../adapter/catalog.ts')

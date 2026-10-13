@@ -6,8 +6,9 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { staticFreeModels } from '../src/adapter/catalog.ts'
 
-import { IpPoolConfigSchema, resolveProbeModels, toIpPoolConfig, IP_POOL_NAMESPACE } from '../src/ip-pool-settings/namespace.ts'
+import { IpPoolConfigSchema, resolveIpPoolSettings, resolveProbeModels, toIpPoolConfig, IP_POOL_NAMESPACE } from '../src/ip-pool-settings/namespace.ts'
 import { buildStatusView, isTrustedBridgeRequest, makeBridgeHandlers, makeBridgeRoutes, IP_POOL_BRIDGE_PREFIX } from '../src/ip-pool-settings/bridge.ts'
 
 // -- namespace ---------------------------------------------------------------
@@ -28,6 +29,9 @@ test('schema fills every default from an empty section', () => {
   assert.deepEqual((value.free as Record<string, unknown>).blockedCountries, ['CN'])
   assert.deepEqual(value.manual, [])
   assert.deepEqual((value.subscription as Record<string, unknown>).urls, [])
+  // The built-in fetch UA is the airport allow-listed spelling, not 1.6.0 —
+  // a real airport answers 502 Bad Gateway for the latter (docs 4.6).
+  assert.equal((value.subscription as Record<string, unknown>).userAgent, 'clash-verge/v2.0')
   assert.equal((value.singbox as Record<string, unknown>).path, 'sing-box')
   assert.equal((value.singbox as Record<string, unknown>).idleStopMs, 600_000)
   assert.equal(value.pinnedExitId, '')
@@ -37,6 +41,38 @@ test('schema fills every default from an empty section', () => {
 test('schema rejects out-of-range probe concurrency', () => {
   assert.throws(() => IpPoolConfigSchema({ maxConcurrentProbes: 9 }))
   assert.throws(() => IpPoolConfigSchema({ maxConcurrentProbes: 0 }))
+})
+
+test('a schema-resolved value keeps its nested subscription urls (legacy [] must not shadow them)', () => {
+  // Regression (live 2026-10-12): the settings page saved a subscription URL,
+  // the Host persisted it, and the pool still assembled with zero subscription
+  // URLs — `/status` reported `subscriptions: null`, so no fetcher was ever
+  // created and the card's subscription count stayed 0. `Schema.array()` hands
+  // an absent array an implicit `[]`, so the resolved value ALWAYS carries the
+  // legacy flat key, and `raw.subscriptions ?? raw.subscription?.urls` resolved
+  // to that empty array. The value must be fed through the schema here: a raw
+  // hand-written section (no flat key at all) cannot reproduce it.
+  const resolved = IpPoolConfigSchema({
+    subscription: { urls: ['https://sub.example.com/token'], refreshMs: 1800000 },
+  } as never)
+  assert.deepEqual((resolved as Record<string, unknown>).subscriptions, [], 'the flat key is present-but-empty in a served value')
+
+  const settings = resolveIpPoolSettings(resolved as never)
+  assert.deepEqual(settings.subscription.urls, ['https://sub.example.com/token'])
+  assert.deepEqual(toIpPoolConfig(settings).subscriptions, ['https://sub.example.com/token'])
+})
+
+test('the legacy flat spelling still carries urls when the nested list is empty', () => {
+  // Older compositions write the flat key only; it must keep working.
+  const settings = resolveIpPoolSettings({ subscriptions: ['https://legacy.example.com/sub'] })
+  assert.deepEqual(settings.subscription.urls, ['https://legacy.example.com/sub'])
+
+  // And when the nested spelling has content it wins over a stale flat list.
+  const both = resolveIpPoolSettings({
+    subscriptions: ['https://stale.example.com/sub'],
+    subscription: { urls: ['https://canonical.example.com/sub'], refreshMs: 60_000, userAgent: 'clash-verge/v2.0' },
+  })
+  assert.deepEqual(both.subscription.urls, ['https://canonical.example.com/sub'])
 })
 
 test('resolveProbeModels defaults to S3 first and dedupes user entries', () => {
@@ -51,7 +87,7 @@ test('toIpPoolConfig maps the settings value onto the plugin config shape', () =
     pinnedExitId: 'http://127.0.0.1:7897',
     pinnedStrict: true,
     maxConcurrentProbes: 7,
-    subscription: { urls: ['https://sub.example.com/token'], refreshMs: 123_456 },
+    subscription: { urls: ['https://sub.example.com/token'], refreshMs: 123_456, userAgent: 'mihomo/1.19.0' },
   }) as never)
   assert.equal(mapped.enabled, true)
   assert.deepEqual(mapped.manual, ['http://1.2.3.4:8080'])
@@ -61,10 +97,10 @@ test('toIpPoolConfig maps the settings value onto the plugin config shape', () =
   assert.deepEqual(mapped.probeModels, ['big-pickle'])
   assert.deepEqual(mapped.singbox, { path: 'sing-box', idleStopMs: 600_000, lanes: 16 })
   // The runtime reads these two off the config shape (ip-pool.ts:
-  // Prober construction + SubscriptionFetcher interval), so dropping them here
-  // would reset them to the default on every live commit.
+  // Prober construction + SubscriptionFetcher interval/UA), so dropping them
+  // here would reset them to the default on every live commit.
   assert.equal(mapped.maxConcurrentProbes, 7)
-  assert.deepEqual(mapped.subscription, { refreshMs: 123_456 })
+  assert.deepEqual(mapped.subscription, { refreshMs: 123_456, userAgent: 'mihomo/1.19.0' })
 })
 
 // -- bridge: status view -------------------------------------------------------
@@ -99,7 +135,7 @@ function fakeRuntime(overrides: Record<string, unknown> = {}): unknown {
     refill: { lastRound: { admitted: 2, rejected: 30, fetched: 1600, coarsePassed: 8, state: 'warning', at: 456 } },
     subscriptions: {
       urlCount: 2,
-      state: { pendingConversion: [{}, {}], convertedAdmitted: 1, plaintextAdmitted: 0, lastFetch: 789, lastError: '' },
+      state: { running: false, pendingConversion: [{}, {}], convertedAdmitted: 1, plaintextAdmitted: 0, lastFetch: 789, lastError: '' },
     },
     probeAll: async () => 2,
     probeExit: async () => 1,
@@ -168,6 +204,45 @@ test('probe handlers: scope all/refill/exit dispatch and reject unknowns', async
   assert.equal((bad as { code: string }).code, 'settings-rejected')
   const missing = await handlers.probe({ scope: 'exit', exitId: 'http://9.9.9.9:1' })
   assert.equal((missing as { code: string }).code, 'unknown-exit')
+})
+
+test('probe handlers: scope subscriptions drives the subscription refresh lane', async () => {
+  // The card's 立即刷新 button used to send scope 'refill' — the free-source
+  // lane — so it never refreshed subscriptions, and `refreshSubscriptions()`
+  // was dead code with no bridge path at all.
+  let refreshed = 0
+  const rt = fakeRuntime({ refreshSubscriptions: async () => { refreshed += 1 } }) as never
+  const handlers = makeBridgeHandlers(() => rt, () => ({ pinnedStrict: false, proxyHosts: [] }))
+  const result = await handlers.probe({ scope: 'subscriptions' })
+  assert.equal(refreshed, 1, 'refreshSubscriptions() is actually called')
+  // The URL count may ride out; the URLs themselves never do (docs §5.1).
+  assert.deepEqual(result, { ok: true, value: { refreshed: true, urlCount: 2 } })
+  assert.equal(JSON.stringify(result).includes('http'), false, 'no URL leaks through the bridge')
+})
+
+test('probe handlers: scope subscriptions reports no-subscriptions instead of a silent success', async () => {
+  // Without a fetcher there is nothing to refresh. Returning ok:true here would
+  // reproduce the original "clicked, nothing happened, no feedback" report.
+  const rt = fakeRuntime({ subscriptions: null }) as never
+  const handlers = makeBridgeHandlers(() => rt, () => ({ pinnedStrict: false, proxyHosts: [] }))
+  const result = await handlers.probe({ scope: 'subscriptions' })
+  assert.equal(result.ok, false)
+  assert.equal((result as { code: string }).code, 'no-subscriptions')
+})
+
+test('probe handlers: scope subscriptions refuses on a disabled pool, not a crash', async () => {
+  const handlers = makeBridgeHandlers(() => null, () => ({ pinnedStrict: false, proxyHosts: [] }))
+  const result = await handlers.probe({ scope: 'subscriptions' })
+  assert.equal(result.ok, false)
+  assert.equal((result as { code: string }).code, 'pool-disabled')
+})
+
+test('subscription refresh errors reach the action response', async () => {
+  const rt = fakeRuntime({ subscriptions: { urlCount: 1, state: { lastError: 'subscription HTTP 502' } } }) as never
+  const handlers = makeBridgeHandlers(() => rt, () => ({ pinnedStrict: false, proxyHosts: [] }))
+  assert.deepEqual(await handlers.probe({ scope: 'subscriptions' }), {
+    ok: false, code: 'subscription-refresh-failed', message: 'subscription HTTP 502',
+  })
 })
 
 test('probe handlers: pool-disabled refusal when no runtime', async () => {
@@ -246,10 +321,10 @@ test('models handler lists S3 static rows plus live catalog through the seam', a
   assert.equal(result.ok, true)
   const value = (result as { value: { models: Array<{ id: string; verified: boolean }> } }).value
   // S3 static list first, all marked verified
-  assert.deepEqual(value.models.slice(0, 6).map((row) => row.verified), [true, true, true, true, true, true])
+  assert.deepEqual(value.models.slice(0, staticFreeModels.length).map((row) => row.verified), staticFreeModels.map(() => true))
   // big-pickle deduped (already static), live-only rows appended unverified
   const ids = value.models.map((row) => row.id)
-  assert.equal(ids.indexOf('muse-spark-1.3-contributor-free') > 5, true, 'live-only row appended after statics')
+  assert.equal(ids.indexOf('muse-spark-1.3-contributor-free') >= staticFreeModels.length, true, 'live-only row appended after statics')
   assert.equal(ids.lastIndexOf('big-pickle'), ids.indexOf('big-pickle'), 'no duplicate big-pickle')
   assert.equal(value.models.find((row) => row.id === 'brand-new-model')?.verified, false)
 })
@@ -259,7 +334,7 @@ test('models handler falls back to the static list without a live seam', async (
   const result = await handlers.models()
   assert.equal(result.ok, true)
   const value = (result as { value: { models: Array<{ id: string; verified: boolean }> } }).value
-  assert.ok(value.models.length >= 6)
+  assert.equal(value.models.length, staticFreeModels.length)
   assert.equal(value.models[0]!.id, 'big-pickle')
 })
 

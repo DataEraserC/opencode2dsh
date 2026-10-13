@@ -179,6 +179,52 @@ test('a host predating the Config export (plain ipPool object) still registers',
   assert.deepEqual(h.registrations, [['opencode2dsh']])
 })
 
+test('catalog changes announce a new host generation only when model metadata changes', async () => {
+  const h = host()
+  let ids = ['big-pickle']
+  let maxOutput = 4096
+  let replacements = 0
+  let disposed = false
+  const refresh = mock.method(ModelCatalog.prototype, 'start', async () => {})
+  const fetchMock = mock.method(globalThis, 'fetch', async (url: unknown) => {
+    return Response.json(String(url).includes('models.dev')
+      ? { opencode: { models: { 'space-bunny-free': { cost: { input: 0, output: 0 } }, 'big-pickle': { cost: { input: 0, output: 0 }, limit: { output: maxOutput } } } } }
+      : { data: ids.map((id) => ({ id })) })
+  })
+  let catalog!: ModelCatalog
+  const warmer = mock.method(ModelCatalog.prototype, 'warm', async function (this: ModelCatalog) {
+    catalog = this
+    await this.refreshOnce()
+  })
+  let adapter!: { listModels(provider: string): Promise<unknown> }
+  h.base.llm = { registerAdapter(_providers, value) {
+    adapter = value as typeof adapter
+    return { replace() { assert.equal(disposed, false); replacements++ } }
+  } }
+  try {
+    apply(h.base, { ...Config({ mode: 'adapter' }), ipPool: h.ipPool })
+    await adapter.listModels('opencode2dsh')
+    const initial = replacements
+    await catalog.refreshOnce()
+    assert.equal(replacements, initial, 'unchanged roster does not republish')
+    ids = ['big-pickle', 'space-bunny-free']
+    await catalog.refreshOnce()
+    assert.equal(replacements, initial + 1, 'new roster publishes once')
+    maxOutput = 8192
+    await catalog.refreshOnce()
+    assert.equal(replacements, initial + 2, 'capability change also republishes')
+    for (const effect of h.effects) effect()
+    disposed = true
+    ids = ['big-pickle']
+    await catalog.refreshOnce()
+    assert.equal(replacements, initial + 2, 'late fetch cannot publish after disposal')
+  } finally {
+    fetchMock.mock.restore()
+    warmer.mock.restore()
+    refresh.mock.restore()
+  }
+})
+
 test('an inject that never fires its callback does not block the route', async () => {
   const h = host()
   h.base.inject = () => Promise.resolve()

@@ -57,6 +57,7 @@ export interface PluginContext {
   inject?(services: string[], callback: (ctx: PluginContext) => void | Promise<void>): unknown
   effect?(fn: () => () => void): unknown
   on?(event: string, listener: (...args: never[]) => unknown): () => void
+  emit?(event: string): unknown
 }
 
 export const name = 'opencode2dsh'
@@ -127,12 +128,32 @@ function applyAdapter(
     ).catch(() => {})
   }
 
+  let disposed = false
+  let registration: unknown
+  let publishedCatalog = ''
+  const catalogSignature = (): string => JSON.stringify(catalog.list().sort().map((id) => [
+    id, catalog.limits(id), catalog.modalities(id), catalog.reasoningCapability(id),
+  ]))
   const catalog = new ModelCatalog({
     refreshSeconds: cfg.refreshSeconds,
     cachePath: defaultCachePath(dataDir),
     onRefresh: (status, lastError) => {
+      if (disposed) return
       writeStatus(status, lastError)
       if (lastError) logger.warn(`opencode2dsh: catalog refresh issue: ${lastError}`)
+      const signature = catalogSignature()
+      if (signature === publishedCatalog) return
+      try {
+        // DSH's handle swaps this registration atomically and announces
+        // llm/adapters-updated, which invalidates the client's cached roster.
+        const handle = registration as { replace?: (providers: string[]) => void } | undefined
+        if (typeof handle?.replace === 'function') handle.replace([PROVIDER_ID])
+        else if (typeof ctx.emit === 'function') ctx.emit('llm/adapters-updated')
+        else return
+        publishedCatalog = signature
+      } catch (err) {
+        logger.warn(`opencode2dsh: catalog announcement failed: ${err instanceof Error ? err.message : String(err)}`)
+      }
     },
   })
   const adapter = new ZenAdapter(catalog, {
@@ -148,7 +169,8 @@ function applyAdapter(
   // deliberately precedes every optional layer below — a throw anywhere in
   // the ip-pool wiring, the stale-route sweep, or the refresh loop must never
   // cost the deployment its only free provider.
-  ctx.llm.registerAdapter([PROVIDER_ID], adapter)
+  publishedCatalog = catalogSignature()
+  registration = ctx.llm.registerAdapter([PROVIDER_ID], adapter)
   logger.info(`opencode2dsh: adapter registered for "${PROVIDER_ID}" (catalog warms up in background)`)
 
   // IP-pool exit routing (docs/ip-pool.md IP-1..IP-5): manual proxies,
@@ -194,6 +216,7 @@ function applyAdapter(
   const maybeEffect = (ctx as { effect?: PluginContext['effect'] }).effect
   if (typeof maybeEffect === 'function') {
     maybeEffect.call(ctx, () => () => {
+      disposed = true
       catalog.stop()
     })
   }

@@ -36,6 +36,20 @@ const SUPPORTED_TYPES = new Set([
   'hysteria', 'hysteria2', 'tuic', 'anytls', 'http', 'socks5',
 ])
 
+/**
+ * The User-Agent the subscription fetch sends. Airports routinely gate on it:
+ * a UA their panel does not recognise comes back as an error page (or a 502
+ * from their edge) instead of a subscription body, and some panels pick the
+ * RETURNED FORMAT from it (a Clash-shaped UA yields `proxies:` YAML, a
+ * v2ray-shaped one yields base64 links). `clash-verge/1.6.0` was measured
+ * 502-ing on a real airport whose allowlist accepts `clash-verge/v2.0`.
+ *
+ * Lives here (the subscription layer's dependency-light module) so the
+ * settings schema default and the fetcher's runtime fallback share one
+ * literal and cannot drift; the fetcher re-exports it for its own callers.
+ */
+export { DEFAULT_SUBSCRIPTION_USER_AGENT } from './subscription-defaults.ts'
+
 /** GoProxy looksLikeYAML: the structural markers of a Clash config. */
 export function looksLikeYaml(content: string): boolean {
   if (/^proxies:\s*$/m.test(content) || /^Proxy:\s*$/m.test(content)) return true

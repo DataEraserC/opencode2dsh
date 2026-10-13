@@ -5,6 +5,7 @@
  * the button's dirty state is `writes.length > 0`.
  */
 import type { FormState, IpPoolSettingsValue } from './IpPoolCard.tsx'
+import { normalizeSubscriptionUserAgent } from '../pool/subscription-defaults.ts'
 
 /** One settings write landing the form on the served value. */
 export interface FieldWrite { field: string; op: 'set'; value: unknown }
@@ -39,7 +40,10 @@ export function diffWrites(form: FormState, value: IpPoolSettingsValue): FieldWr
   push('enabled', form.enabled, value.enabled)
   push('free', { enabled: form.freeEnabled, targetSize: Number(form.targetSize), blockedCountries: splitCsv(form.blockedCountries) }, value.free)
   push('manual', form.manual, value.manual)
-  push('subscription', { urls: form.subscriptionUrls, refreshMs: Number(form.refreshMs) }, value.subscription)
+  // A `set` replaces the whole `subscription` node, so the fetch User-Agent
+  // has to ride along: a URL or interval edit that omitted it would silently
+  // reset the field to its default.
+  push('subscription', { urls: form.subscriptionUrls, refreshMs: Number(form.refreshMs), userAgent: normalizeSubscriptionUserAgent(form.userAgent) }, value.subscription)
   push('singbox', { path: form.singboxPath, idleStopMs: Number(form.singboxIdleStopMs), lanes: Number(form.singboxLanes) }, value.singbox)
   push('pinnedExitId', form.pinnedExitId, value.pinnedExitId)
   push('pinnedStrict', form.pinnedStrict, value.pinnedStrict)
