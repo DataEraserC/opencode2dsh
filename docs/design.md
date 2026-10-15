@@ -5,7 +5,7 @@
 
 ## 1. 定位（一句话）
 
-opencode2dsh 是一个 **DSH cordis 插件**：它在 DSH 进程旁拉起一台**单租户、匿名通道专用**的本地 Go 代理（移植自 opencode2api），把 OpenCode Zen 的「匿名免费模型」（`Authorization: Bearer public`）包装成一个标准的 OpenAI 兼容 provider 端点，使 DSH 无需任何 key、无需登录即可调用 `https://opencode.ai/zen` 上标记为免费的模型。
+opencode2dsh 是一个 **DSH cordis 插件**：它在 DSH 进程旁拉起一台**单租户、匿名通道专用**的本地 Go 代理（移植自 opencode2api），把 OpenCode Zen 的「匿名免费模型」（`Authorization: Bearer public`）包装成一个标准的 OpenAI 兼容 provider 端点，使 DSH 无需任何 key、无需登录即可调用 OpenCode 匿名车道上标记为免费的模型（2026-10-15 起 chat 面为 `https://opencode.ai/inference`，见 §3.5）。
 
 **改名/定位说明**：原项目 opencode2api 是「多租户、多 key、带 WebUI 的通用网关」；opencode2dsh 取其匿名链路子集，收缩为「DSH 专用的单用户本地桥」。产品语义是"接入 OpenCode 官方提供的免费匿名通道"，不是"绕过付费"。
 
@@ -41,7 +41,7 @@ opencode2dsh 是一个 **DSH cordis 插件**：它在 DSH 进程旁拉起一台*
         └──────────────────┬──────────────────────────┘
                            │ HTTPS
                            ▼
-              https://opencode.ai/zen/v1/...
+              https://opencode.ai/inference/v1/...
               (Authorization: Bearer public
                + x-opencode-client: cli 等)
 ```
@@ -85,7 +85,7 @@ opencode2api 的核心价值在于**三协议（Chat / Responses / Anthropic）�
 ### 2.4 匿名链路时序（一次 chat 请求）
 
 ```
-DSH                opencode2dsh-agent (Go)                opencode.ai/zen
+DSH                opencode2dsh-agent (Go)                opencode.ai/inference
  │                       │                                    │
  │ POST /v1/chat/completions                                  │
  │ Authorization: Bearer <local-token>                        │
@@ -102,7 +102,7 @@ DSH                opencode2dsh-agent (Go)                opencode.ai/zen
  │                       │ Route() → {Tier:zen, Anonymous:true}│
  │                       │ newUpstreamRequest()                │
  │                       │───────────────────────────────────►│
- │                       │ POST https://opencode.ai/zen/v1/chat/completions
+ │                       │ POST https://opencode.ai/inference/v1/chat/completions
  │                       │ Content-Type: application/json
  │                       │ Accept: application/json, text/event-stream
  │                       │ User-Agent: opencode/1.18.31 (<goos> <goarch>; <goversion>)
@@ -112,8 +112,8 @@ DSH                opencode2dsh-agent (Go)                opencode.ai/zen
   │                       │   14base62 = sha256("ses\0"+signal) 派生（会话亲和）
  │                       │ x-session-affinity: <同上>
  │                       │ X-Session-Id: <同上>
- │                       │ x-opencode-request: req_<32hex>
- │                       │ x-opencode-project: prj_<24hex>
+ │                       │ x-opencode-request: req_<32hex>   ← 2026-10-15 起不发（发即 403，§3.5）
+ │                       │ x-opencode-project: global        ← prj_ 前缀即 403，改用品牌默认值
  │                       │ Authorization: Bearer public        ← 匿名凭证
  │                       │                                    │
  │                       │      ◄──── 200 text/event-stream ──│
@@ -133,7 +133,7 @@ DSH                opencode2dsh-agent (Go)                opencode.ai/zen
 | 免费判定 | `anonymousDecision` → `modelMetadataStore.Decide` | models.go:253-258；model_metadata.go:192-237（`!deprecated && input==0 && output==0`；`isFreeModel` 名称含 `free` 兜底，models.go:303-305） |
 | 上游请求构造 | `newUpstreamRequest` | gateway.go:640-669（全部请求头注入；Chat 走 `Authorization: Bearer <key>`，key=`"public"`，常量 `anonymousZenKey` @ gateway.go:20） |
 | 匿名尝试 | `Gateway.doAnonymousUpstream` | gateway.go:424-483（逐 proxy 尝试至多一轮；仅 2xx 结束） |
-| 上游端点 | `UpstreamConfig.Zen` 默认值 | config.go:85：`https://opencode.ai/zen`；路径拼接 `protocolPath` gateway.go:789-798（Chat → `/v1/chat/completions`） |
+| 上游端点 | `UpstreamConfig.Zen` 默认值 | config.go:85：`https://opencode.ai/zen`；路径拼接 `protocolPath` gateway.go:789-798（Chat → `/v1/chat/completions`）。**2026-10-15 起 chat 面迁到 `https://opencode.ai/inference`**：`/zen/v1/chat/completions` 对任何请求都回 403 FreeTierError，插件写入的 `upstream.zen` 随之改为 inference 面（见 §3.5） |
 | 流式回传 | 协议相同则透传 | gateway.go:291-298：`io.Copy(w, TeeReader(resp.Body, observer))`；协议不同才 `transcodeStreamWithUsage`（stream.go:49） |
 | 非流式回传 | 协议相同时原样 | gateway.go:307-325 |
 
@@ -145,6 +145,11 @@ DSH                opencode2dsh-agent (Go)                opencode.ai/zen
 2. **模型白名单**：OpenCode 服务端在模型 schema 上有 `allowAnonymous` 标记（opencode 仓库 `packages/console/core/src/model.ts:28`），仅带标记的模型能从 `Bearer public` 命中；客户端侧无法枚举该标记，只能靠 models.dev 成本数据 + 名称启发式**逼近**（§4）。
 3. **计费语义**：匿名请求的账单来源标记为 `anonymous`，不产生扣费。opencode2dsh 不配置任何认证 key，因此 `doUpstream` 的认证回退分支（gateway.go:390-410）恒为空 —— 匿名失败就是失败，不做付费降级。
 4. **限流**：OpenCode 对匿名请求按**出口 IP** 限流，阈值在平台侧 Secret 配置，公开仓库不可见。表现为 401/403/429 或 5xx。opencode2dsh 的应对见 §9；**必须诚实表述为「匿名配额受上游限流」，任何多 IP 轮换能力默认关闭且仅限自部署场景**（§9.2）。
+5. **端点迁移与 agent-shape 门（2026-10-15 实测）**：免费通道的 chat 面已从 `/zen/v1` 迁到 `https://opencode.ai/inference/v1/chat/completions`。`/zen/v1/chat/completions` 现在对**任何** body 都回 `403 FreeTierError`，而 `/zen/v1/models` 与 `/inference/v1/models` 同时 200 且名单一致（本机实测各 85 个 id），所以**只探测模型列表完全看不出这次迁移** —— 这正是故障表现为「模型可选、每轮必失败」的原因。
+
+   放行需**同时**满足五条：① 打到 inference 面；② `Authorization: Bearer public`；③ User-Agent 是车道仍服务的 `opencode/<major>.<minor>.<patch>`（`opencode/1.18.31` 通过，更老的次版本回 **426**，缺段或缺斜杠回 403）；④ `x-opencode-session` / `x-session-affinity` / `X-Session-Id` **任一**携带规范 `ses_*`（**单独**发 `x-opencode-session-id` 不放行，实测 3/3 403）；⑤ `tools` 里 `read` 的 `parameters.properties` **非空**。
+
+   三种形态**任一**即 403：带非空 `x-opencode-request` 头、`x-opencode-project` 以 `prj_` 开头、把 `bash`/`shell`/`edit`/`glob`/`grep`/`read`/`write` 中任一个以**空** `properties` 广播（占位 stub 比不广播更糟）。四条改动**缺一不可**：本机逐项消融显示，只修其中任意一条仍是 403，四条齐备才 200。插件的对应改动见 CHANGELOG「Unreleased」。
 
 ## 4. 免费模型列表策略
 
@@ -152,7 +157,7 @@ DSH                opencode2dsh-agent (Go)                opencode.ai/zen
 
 | 优先级 | 来源 | 内容 | 刷新 |
 | --- | --- | --- | --- |
-| S1 动态主源 | `GET https://opencode.ai/zen/v1/models`（`Authorization: Bearer public`，models.go:587-618 `fetchModels`） | Zen 上当前在售模型全集（含免费与付费，**不含 allowAnonymous 标记**） | 默认 300s（复用 `models.refresh_seconds`） |
+| S1 动态主源 | `GET {lane}/v1/models`（`Authorization: Bearer public`，models.go:587-618 `fetchModels`；`{lane}` 现为 `https://opencode.ai/inference`，两个面名单一致） | Zen 上当前在售模型全集（含免费与付费，**不含 allowAnonymous 标记**） | 默认 300s（复用 `models.refresh_seconds`） |
 | S2 免费判定 | `GET https://models.dev/api.json`（model_metadata.go:21 `modelsDevDefaultURL`，24h 刷新，带磁盘缓存 `config.json.models.dev.json`） | 每模型 `input_cost`/`output_cost`/`deprecated` → `Decide()` 判定免费 | 24h + 启动时读缓存 |
 | S3 静态兜底 | 编译期嵌入的模型清单（Go 常量表） | 已知可用匿名模型 id 列表（以 Phase 0 实测为准填充；预置 `gpt-oss-120b`、`gpt-oss-20b`、`deepseek-v4-flash`、`qwen3-coder-480b` 等，**以实测为准，交付前校准**） | 随版本发布更新 |
 
@@ -206,7 +211,7 @@ opencode2dsh 的 Go 部分命名 `opencode2dsh-agent`，Go module 采用 `cmd/ag
 | 方法/路径 | 行为 | 对应上游 |
 | --- | --- | --- |
 | `GET /v1/models` | 本地鉴权后返回免费模型清单（§4） | S1/S2/S3 合并 |
-| `POST /v1/chat/completions` | 本地鉴权 → 匿名转发（流式/非流式均支持） | `POST https://opencode.ai/zen/v1/chat/completions` |
+| `POST /v1/chat/completions` | 本地鉴权 → 匿名转发（流式/非流式均支持） | `POST https://opencode.ai/inference/v1/chat/completions`（2026-10-15 起；`/zen` 同路径 403，见 §3.5） |
 | `GET /healthz` | 无需鉴权；`{"status","ready","version","models":{...},"anonymous":true}`；模型目录 pending/stale/empty、无健康出口时降级（移植 gateway.go:108-168） | — |
 
 `/v1/responses`、`/v1/messages` 不注册（对应 gateway.go:102-103 两行不移植）。
@@ -260,7 +265,7 @@ cordis 插件 service 工厂
   "server_keys": ["<random token>"],
   "anonymous": true,
   "zen_keys": [], "go_keys": [],          // 恒空：opencode2dsh 不做认证通道
-  "upstream": { "zen": "https://opencode.ai/zen" },
+  "upstream": { "zen": "https://opencode.ai/inference" },   // 2026-10-15 起插件写 inference 面
   "models": { "refresh_seconds": 300 },
   "retry": { "max_attempts": 2, "timeout_seconds": 300 },
   "proxies": ["direct"],                   // 多代理仅当用户显式配置

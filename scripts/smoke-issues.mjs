@@ -21,6 +21,9 @@ const entry = process.argv[3]
   ? await import(pathToFileURL(join(resolve(process.argv[3]), 'lib/index.js')))
   : await import('../packages/plugin/lib/index.js')
 const { postBridgeAction } = await import('../packages/plugin/src/client/bridge-action.ts')
+// The models roster's base URL, taken from the shipped constant so a lane move
+// (2026-10-15: /zen -> /inference) cannot leave this stub matching nothing.
+const { ZEN_BASE_URL } = await import('../packages/plugin/src/adapter/catalog.ts')
 const { Config: pluginSchema, ...configuredEntry } = entry
 const schema = new HostSchema(pluginSchema.toJSON())
 const savedFetch = globalThis.fetch
@@ -89,7 +92,7 @@ try {
   os.homedir = () => scratch
   syncBuiltinESMExports()
   globalThis.fetch = async (url, init) => {
-    if (String(url).includes('/zen/v1/models')) {
+    if (String(url).includes(`${ZEN_BASE_URL}/v1/models`)) {
       return savedFetch(`${httpOrigin}/models`, init)
     }
     if (String(url).includes('models.dev')) return savedFetch(`${httpOrigin}/metadata`, init)
