@@ -2,25 +2,23 @@ import { createHash, randomBytes } from 'node:crypto'
 
 /**
  * Port of agent/internal/ids (opencode2api ids.go, verbatim semantics):
- * stable session ids derived from the conversation's first user turn, plus the
- * project id the upstream expects. The upstream sees CLI-identical correlation
+ * stable session/project ids derived from the conversation's first user turn,
+ * and a per-request random id. The upstream sees CLI-identical correlation
  * headers built from these (zen-adapter.ts).
  */
 
 export interface RequestIDs {
   session: string
+  request: string
   project: string
   parentSession: string
 }
 
-/**
- * The project id sent upstream. The lane refuses this adapter's own `prj_*`
- * spelling outright (live-probed 2026-10-15: `prj_*` answers 403
- * FreeTierError while `global`, a 40-hex id, an arbitrary token and an empty
- * value all answer 200). The brand default is the honest choice: this adapter
- * has no workspace identity to report.
- */
-export const DEFAULT_PROJECT_ID = 'global'
+/** sha256("prefix\0value") truncated to 12 bytes: stable, non-reversible. */
+export function stableID(prefix: string, value: string): string {
+  const sum = createHash('sha256').update(prefix + '\x00' + value).digest()
+  return `${prefix}_${sum.subarray(0, 12).toString('hex')}`
+}
 
 export function randomID(prefix: string, size: number): string {
   return `${prefix}_${randomBytes(size).toString('hex')}`
@@ -57,7 +55,8 @@ export function deriveRequestIDs(messages: Array<{ role: string; content: unknow
   if (signal === '' || signal === '{}') signal = randomID('fallback', 16)
   return {
     session: canonicalSessionID(signal),
-    project: DEFAULT_PROJECT_ID,
+    request: randomID('req', 16),
+    project: stableID('prj', 'opencode2dsh:default-project'),
     parentSession: '',
   }
 }
@@ -69,7 +68,7 @@ export function deriveRequestIDs(messages: Array<{ role: string; content: unknow
  * only be used from within OpenCode") — the plain User-Agent gate stopped
  * being sufficient (upstream fix: jasonxu114514/opencode2api 8185202).
  * Live-probed 2026-09-18: the gate has a second, body-shape half (streaming
- * + an agent-shaped `tools` array, adapter/messages.ts); both must pass.
+ * + bash/read tools, adapter/messages.ts); both must pass.
  *
  * Issue #62 (2026-10-13): matching that SHAPE stopped being sufficient. The
  * 12 hex characters are not an arbitrary blob — they encode a real
@@ -102,10 +101,12 @@ function base62Fixed(value: bigint, width: number): string {
  *
  * The sequence matters: the low 12 bits are exactly `counter`, and the
  * inversion flips them, which is why a real counter-1 session ends its time
- * segment in `ffe` — a structural consequence, not a magic marker. Upstream
- * reads the segment back and checks it against a wall-clock reading; a digest
- * prefix has no such structure, so it is rejected even though it matches the
- * regex.
+ * segment in `ffe` — a structural consequence, not a magic marker. Live
+ * probes (2026-10-13) show the free tier reads those low 12 bits back as a
+ * per-millisecond counter and accepts only `[0, 63]`; the high 36 clock bits
+ * are not checked (an id whose clock decodes to 1970 still passes). A digest
+ * prefix lands in that window ~1.5% of the time, so it is rejected almost
+ * always even though it matches the regex.
  *
  * We always mint counter 1: this plugin is the only writer of its own
  * sessions, so a per-millisecond counter would only add state.
@@ -154,8 +155,10 @@ export function canonicalSessionID(signal: string): string {
   const randomPart = base62Fixed(BigInt('0x' + sum.subarray(6, 16).toString('hex')), 14)
   const session = `ses_${timePart}${randomPart}`
 
-  // Evict the oldest entry rather than clearing: insertion-ordered Map, and a
-  // live conversation's entry is re-inserted on every request.
+  // Evict the oldest entry rather than clearing. Insertion-ordered Map, so
+  // this is FIFO by first mint, NOT LRU: a hit returns early above and does
+  // not re-insert. That is fine here — 1024 live conversations is far past
+  // any realistic window, and a re-minted id only costs cache affinity.
   if (sessionMemo.size >= SESSION_MEMO_LIMIT) {
     const oldest = sessionMemo.keys().next()
     if (!oldest.done) sessionMemo.delete(oldest.value)
@@ -170,21 +173,22 @@ export function opencodeUserAgent(): string {
 }
 
 /**
- * The correlation header set sent with every upstream request.
+ * The full disguise header set sent with every upstream request
+ * (design.md 2.4; gateway.go newUpstreamRequest:640-669).
  *
- * `x-opencode-request` is deliberately absent: since 2026-10-15 the free lane
- * answers 403 FreeTierError for any request carrying a non-empty value
- * (measured 2026-10-15; empty or whitespace-only values still pass, but there
- * is nothing to report in the header). `x-opencode-project` must keep
- * {@link DEFAULT_PROJECT_ID}'s non-`prj_` spelling for the same reason.
+ * `x-opencode-request` is never sent — any value is refused (#75). The project
+ * header carries `global` rather than a `prj_` id, which is refused too (#75).
+ * `x-opencode-session-id` repeats the session id, required once the User-Agent
+ * claims an opencode release above 1.18.33 (#74, #78).
  */
 export function disguiseHeaders(ids: RequestIDs): Record<string, string> {
   return {
     'user-agent': opencodeUserAgent(),
     'x-opencode-client': 'cli',
     'x-opencode-session': ids.session,
+    'x-opencode-session-id': ids.session,
     'x-session-affinity': ids.session,
     'X-Session-Id': ids.session,
-    'x-opencode-project': ids.project,
+    'x-opencode-project': 'global',
   }
 }

@@ -6,12 +6,9 @@ import assert from 'node:assert/strict'
 import { opencodeUserAgent } from '../src/adapter/ids.ts'
 import { decodeModelsDev, decide, fetchZenModels, FREE_LANE_BLOCKLIST, isFreeModel, ModelCatalog, staticFreeModels, ZEN_BASE_URL } from '../src/adapter/catalog.ts'
 
-/**
- * The models roster the default catalog fetches. Built from the shipped
- * constant so a base-URL move (2026-10-15: /zen -> /inference) cannot leave a
- * stale literal behind that silently makes the fake fetch miss.
- */
-const ZEN_MODELS_URL = `${ZEN_BASE_URL}/v1/models`
+/** The live models endpoint, derived from the adapter's own base URL so an endpoint
+ *  move cannot leave a silently dead literal behind (#75). */
+const ZEN_MODELS_URL = `${ZEN_BASE_URL.replace(/\/+$/, '')}/v1/models`
 
 function price(input?: number, output?: number, deprecated = false, reasoning = false) {
   return { input, output, deprecated, reasoning }
@@ -330,16 +327,15 @@ test('start() fast-retries while the live catalog is empty, then settles into th
 
 test('fetchZenModels sends the anonymous CLI disguise and parses ids', async () => {
   const capture: { url?: string; init?: RequestInit } = {}
-  // the base is injected here, so this also pins the trailing-slash join
-  const ids = await fetchZenModels('https://zen-mirror.example/root/', fakeFetch({ 'https://zen-mirror.example/root/v1/models': zenBody }, capture), opencodeUserAgent())
+  const ids = await fetchZenModels(`${ZEN_BASE_URL}/`, fakeFetch({ [ZEN_MODELS_URL]: zenBody }, capture), opencodeUserAgent())
   assert.deepEqual(ids, ['qwen-free', 'paid-model', 'ghost-free', 'legacy-free'])
-  assert.equal(capture.url, 'https://zen-mirror.example/root/v1/models')
+  assert.equal(capture.url, ZEN_MODELS_URL)
   const headers = new Headers(capture.init?.headers)
   assert.equal(headers.get('authorization'), 'Bearer public')
   assert.equal(headers.get('x-opencode-client'), 'cli')
   assert.ok(headers.get('user-agent')?.startsWith('opencode/'))
   await assert.rejects(
-    fetchZenModels('https://zen-mirror.example/root', fakeFetch({ 'https://zen-mirror.example/root/v1/models': { data: [] } }), opencodeUserAgent()),
+    fetchZenModels(ZEN_BASE_URL, fakeFetch({ [ZEN_MODELS_URL]: { data: [] } }), opencodeUserAgent()),
     /empty list/,
   )
 })

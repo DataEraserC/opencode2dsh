@@ -122,8 +122,8 @@ test('admission: fail-fast at each step (echo/geo/latency/models/smoke)', async 
   assert.ok(!result.admitted)
   assert.match(result.reason!, /zen smoke HTTP 403/)
 
-  // the smoke body must satisfy the free-lane gate (re-probed 2026-10-15):
-  // streaming, the official `read` tool with a real schema (an empty-schema
+  // the smoke body must satisfy the free-lane gate (measured in #74/#75/#78):
+  // streaming, the injected bash/read tools with real schemas (an empty-schema
   // stub on a gate-shaped name is itself a 403), and a canonical ses_* header
   const okTransport = fakeTransport(okScript())
   const okResult = await admitCandidate(deps(okTransport), { address: 'h:1', protocol: 'http', source: 'free' }, { timeoutMs: 1000 })
@@ -136,7 +136,7 @@ test('admission: fail-fast at each step (echo/geo/latency/models/smoke)', async 
   assert.equal(smokeBody.stream, true)
   assert.equal(smokeBody.tool_choice, 'none')
   const smokeToolNames = smokeBody.tools?.map((t) => t.function.name) ?? []
-  assert.deepEqual([...smokeToolNames].sort(), ['read'])
+  assert.deepEqual([...smokeToolNames].sort(), ['bash', 'read'])
   const readTool = smokeBody.tools?.find((t) => t.function.name === 'read')
   assert.ok(readTool, 'gate tool present')
   assert.ok(Object.keys(readTool!.function.parameters?.properties ?? {}).length > 0, 'read carries a non-empty schema')

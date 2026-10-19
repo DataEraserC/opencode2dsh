@@ -107,9 +107,9 @@ DSH                opencode2dsh-agent (Go)                opencode.ai/inference
  │                       │ Accept: application/json, text/event-stream
  │                       │ User-Agent: opencode/1.18.31 (<goos> <goarch>; <goversion>)
  │                       │ x-opencode-client: cli
-  │                       │ x-opencode-session: ses_<12hex+14base62> ← 规范格式
-  │                       │   12hex = ~(Date.now()*0x1000 + counter) ← 真实时钟（#62）
-  │                       │   14base62 = sha256("ses\0"+signal) 派生（会话亲和）
+ │                       │ x-opencode-session: ses_<12hex+14base62> ← 规范格式
+ │                       │   12hex = ~(Date.now()*0x1000 + counter) ← 上游生成器公式（#62）
+ │                       │   14base62 = sha256("ses\0"+signal) 派生（会话亲和）
  │                       │ x-session-affinity: <同上>
  │                       │ X-Session-Id: <同上>
  │                       │ x-opencode-request: req_<32hex>   ← 2026-10-15 起不发（发即 403，§3.5）
@@ -147,7 +147,7 @@ DSH                opencode2dsh-agent (Go)                opencode.ai/inference
 4. **限流**：OpenCode 对匿名请求按**出口 IP** 限流，阈值在平台侧 Secret 配置，公开仓库不可见。表现为 401/403/429 或 5xx。opencode2dsh 的应对见 §9；**必须诚实表述为「匿名配额受上游限流」，任何多 IP 轮换能力默认关闭且仅限自部署场景**（§9.2）。
 5. **端点迁移与 agent-shape 门（2026-10-15 实测）**：免费通道的 chat 面已从 `/zen/v1` 迁到 `https://opencode.ai/inference/v1/chat/completions`。`/zen/v1/chat/completions` 现在对**任何** body 都回 `403 FreeTierError`，而 `/zen/v1/models` 与 `/inference/v1/models` 同时 200 且名单一致（本机实测各 85 个 id），所以**只探测模型列表完全看不出这次迁移** —— 这正是故障表现为「模型可选、每轮必失败」的原因。
 
-   放行需**同时**满足五条：① 打到 inference 面；② `Authorization: Bearer public`；③ User-Agent 是车道仍服务的 `opencode/<major>.<minor>.<patch>`（`opencode/1.18.31` 通过，更老的次版本回 **426**，缺段或缺斜杠回 403）；④ `x-opencode-session` / `x-session-affinity` / `X-Session-Id` **任一**携带规范 `ses_*`（**单独**发 `x-opencode-session-id` 不放行，实测 3/3 403）；⑤ `tools` 里 `read` 的 `parameters.properties` **非空**。
+   放行需**同时**满足五条：① 打到 inference 面；② `Authorization: Bearer public`；③ User-Agent 是车道仍服务的 `opencode/<major>.<minor>.<patch>`（`opencode/1.18.31` 通过，更老的次版本回 **426**，缺段或缺斜杠回 403）；④ `x-opencode-session` / `x-session-affinity` / `X-Session-Id` **任一**携带规范 `ses_*`（单独发 `x-opencode-session-id` 不放行，实测 3/3 403；但 UA 声明 1.18.33 以上时它又是必需的随附头，#74/#78 —— 插件因此四个会话头全发）；⑤ `tools` 里 `bash` 与 `read` 的 `parameters.properties` 均**非空**（2026-10-16 上游复测 #74/#75/#78：两个门控工具都必需，取代本地 10-15 消融得出的「只需 `read`」）。
 
    三种形态**任一**即 403：带非空 `x-opencode-request` 头、`x-opencode-project` 以 `prj_` 开头、把 `bash`/`shell`/`edit`/`glob`/`grep`/`read`/`write` 中任一个以**空** `properties` 广播（占位 stub 比不广播更糟）。四条改动**缺一不可**：本机逐项消融显示，只修其中任意一条仍是 403，四条齐备才 200。插件的对应改动见 CHANGELOG「Unreleased」。
 
