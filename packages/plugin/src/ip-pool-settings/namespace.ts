@@ -121,6 +121,8 @@ export const IpPoolConfigSchema = Schema.object({
   proxyHosts: Schema.array(Schema.string()).default([]),
   /** Same-request rotate attempts on pre-content transport/429 failures (§3.4). */
   maxRotateAttempts: Schema.number().min(0).max(10).step(1).default(3),
+  /** Periodic health-probe tick (§4.6 probeIntervalMs, default 10min). */
+  probeIntervalMs: Schema.number().min(60_000).max(24 * 60 * 60_000).step(1).default(10 * 60_000),
 })
 
 /** The resolved ip-pool settings value (schema defaults → base → user). */
@@ -136,6 +138,7 @@ export interface IpPoolSettings {
   pinnedStrict: boolean
   proxyHosts: string[]
   maxRotateAttempts: number
+  probeIntervalMs: number
 }
 
 /** Resolve the schema-level default for the probe model set (§4.6). */
@@ -169,6 +172,7 @@ export interface AnyIpPoolSection {
   probeModels?: string[]
   maxConcurrentProbes?: number
   maxRotateAttempts?: number
+  probeIntervalMs?: number
 }
 
 /**
@@ -205,6 +209,7 @@ export function resolveIpPoolSettings(value: AnyIpPoolSection | undefined): IpPo
     pinnedStrict: raw.pinnedStrict ?? false,
     proxyHosts: raw.proxyHosts ?? [],
     maxRotateAttempts: raw.maxRotateAttempts ?? 3,
+    probeIntervalMs: raw.probeIntervalMs ?? 10 * 60_000,
   }
 }
 
@@ -226,6 +231,7 @@ export function toIpPoolConfig(value: IpPoolSettings): {
   probeModels: string[]
   maxConcurrentProbes: number
   maxRotateAttempts: number
+  probeIntervalMs: number
 } {
   return {
     enabled: value.enabled,
@@ -244,5 +250,6 @@ export function toIpPoolConfig(value: IpPoolSettings): {
     probeModels: resolveProbeModels(value.probeModels),
     maxConcurrentProbes: value.maxConcurrentProbes,
     maxRotateAttempts: value.maxRotateAttempts,
+    probeIntervalMs: value.probeIntervalMs,
   }
 }

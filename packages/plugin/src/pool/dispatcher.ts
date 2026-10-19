@@ -18,13 +18,19 @@ import { AsyncLocalStorage } from 'node:async_hooks'
 
 import { Agent, ProxyAgent, type Dispatcher } from 'undici'
 
-import type { ExitPool } from './pool.ts'
+import type { ExitPool, ExitProtocol } from './pool.ts'
 import { laneNodeOf, type LaneBinding } from './lanes.ts'
 
 /** Structural seam over npm undici so tests can inject fakes. */
 export interface UndiciSeam {
   Agent: typeof Agent
-  ProxyAgent: typeof ProxyAgent
+  /**
+   * Structural over `typeof ProxyAgent`: the real constructor takes
+   * `proxyTls`, and https:// exits need it (see httpsProxyOptions) — but the
+   * test fakes accept a single argument, so the wider real signature cannot
+   * be required here without breaking every existing seam double.
+   */
+  ProxyAgent: new (options: { uri: string; clientFactory?: (origin: URL | string, options?: unknown) => unknown; proxyTls?: { rejectUnauthorized?: boolean } }) => Dispatcher
   setGlobalDispatcher(dispatcher: Dispatcher): unknown
   getGlobalDispatcher(): Dispatcher
   /**
@@ -130,9 +136,23 @@ export function isLoopback(host: string): boolean {
   return normalized === 'localhost' || normalized === '127.0.0.1' || normalized === '::1'
 }
 
-/** Map an exit address to a ProxyAgent URI ('h:1' -> 'http://h:1'). */
-export function exitProxyUri(exitId: string, protocol: 'http' | 'socks5'): string {
-  const scheme = protocol === 'socks5' ? 'socks5' : 'http'
+/**
+ * Map an exit address to a ProxyAgent URI ('h:1' -> 'http://h:1').
+ *
+ * `https` MUST survive as its own scheme: undici only wraps CONNECT in TLS
+ * when the proxy URI scheme is `https:` (proxy-agent.js, `forwardConnect =
+ * this[kProxy].protocol === 'https:'`). Downgrading an `https://` proxy to a
+ * plaintext `http://` URI sends a bare CONNECT to a TLS listener, which drops
+ * the connection without ever sending a status line — undici surfaces exactly
+ * that as `SocketError: other side closed` (client-h1.js, onHttpSocketEnd),
+ * and the rule table then correctly but uselessly strikes a healthy exit dead.
+ * Measured live 2026-10-15: 46 of 118 exits failed that way, all on ports
+ * 443/9002/9443; every sampled one completed a TLS handshake and answered
+ * CONNECT 200 once the request was wrapped (certs *.windscribe.com,
+ * *.nodes.gen4.ninja).
+ */
+export function exitProxyUri(exitId: string, protocol: ExitProtocol): string {
+  const scheme = protocol === 'socks5' ? 'socks5' : protocol === 'https' ? 'https' : 'http'
   return PROXY_PROTOCOL_PREFIX.test(exitId) ? exitId : `${scheme}://${exitId}`
 }
 
@@ -159,6 +179,29 @@ function wrapLaneRelease(handler: Dispatcher.DispatchHandler, release: () => voi
       }
     },
   }) as Dispatcher.DispatchHandler
+}
+
+/**
+ * ProxyAgent options for an https:// exit, including the one setting that
+ * decides whether it connects at all.
+ *
+ * Measured 2026-10-15 against live subscription exits: a bare
+ * `new ProxyAgent({ uri: 'https://203.0.113.7:443' })` fails EVERY request
+ * with `Secure Proxy Connection failed`. The cause is certificate
+ * verification, not connectivity: these exits are addressed by IP literal, so
+ * there is no hostname a certificate could be issued for, and undici falls
+ * back to `rejectUnauthorized: true` — every handshake is then rejected.
+ * Passing `proxyTls: { rejectUnauthorized: false }` made all sampled exits
+ * serve `http://ip-api.com` with 200.
+ *
+ * Only the PROXY HOP is unverified. The tunneled request still runs through
+ * undici's normal TLS path to the real target, so end-to-end confidentiality
+ * to `opencode.ai` is unchanged; what is given up is authentication of the
+ * proxy's own identity, for which an IP literal offers nothing to check
+ * against anyway. This mirrors what sing-box does for the converted exits.
+ */
+export function httpsProxyOptions(): { proxyTls: { rejectUnauthorized: boolean } } {
+  return { proxyTls: { rejectUnauthorized: false } }
 }
 
 /**
@@ -247,6 +290,7 @@ export class PoolRoutingDispatcher implements RoutingDispatcherSurface {
       const seam = this.#undici
       const agent = new seam.ProxyAgent({
         uri: exitProxyUri(exit.id, exit.protocol),
+        ...(exit.protocol === 'https' ? httpsProxyOptions() : {}),
         clientFactory: (origin: URL | string, opts?: unknown) =>
           new seam.Agent({ ...(opts as object), pipelining: 0 }),
       })
@@ -416,8 +460,11 @@ export class PoolRoutingDispatcher implements RoutingDispatcherSurface {
    * (live repro: 10.255.255.1:9999 blackhole, seen:[] callbacks). So the
    * wrapper arms a timer at dispatch time; any handler callback disarms it,
    * and silence past the deadline counts as a transport failure (dead strike
-   * + session reroute). The sentinel never aborts the request itself — fetch
-   * and pi-ai own their own timeouts.
+   * + session reroute) — on that silence path ONLY the sentinel synthesizes
+   * the response-error the handler owes and aborts the controller (fetch
+   * rejects at once instead of hanging forever). A real onResponseError is
+   * forwarded untouched; the sentinel never injects alongside a genuine
+   * failure (#87).
    */
   #observe(exitId: string, model: string, session: string, handler: Dispatcher.DispatchHandler): Dispatcher.DispatchHandler {
     const pool = this.#pool
@@ -436,22 +483,33 @@ export class PoolRoutingDispatcher implements RoutingDispatcherSurface {
     // The most recent controller the wrapper has seen (undici hands a fresh
     // one to each handler callback; abort must go to the live one).
     let liveController: { abort?(reason: Error): void } | null = null
-    const classifyTransport = (): void => {
-      if (classified) return
+    /** Record the transport-grade failure once. Returns true only for the
+     *  caller that actually classified the dispatch. */
+    const recordTransport = (): boolean => {
+      if (classified) return false
       classified = true
       pool.recordPassiveTransport(exitId)
       pool.rerouteSession(session)
-      // Live-observed (2026-09-07, muse via 7897): after the tunnel stands a
-      // dead-behind-the-tunnel exit answers NOTHING — no headers, no
-      // onResponseError — and neither fetch nor pi-ai owns a body-silence
-      // timeout, so the request hangs forever (the turn never finished; the
-      // stop button's abort never reached it). The sentinel therefore does
-      // more than bookkeeping: it tears the dispatch down BOTH ways — abort
-      // the controller when we have one, and when the blackhole path never
-      // handed us a single callback (no controller exists) synthesize the
-      // response-error the handler owes, so fetch rejects at once, pi-ai
-      // turns that into an error event, and the adapter's rotate loop gets
-      // to move the session to a live exit.
+      return true
+    }
+    /**
+     * Sentinel-only teardown. Live-observed (2026-09-07, muse via 7897): after
+     * the tunnel stands a dead-behind-the-tunnel exit answers NOTHING — no
+     * headers, no onResponseError — and neither fetch nor pi-ai owns a
+     * body-silence timeout, so the request hangs forever (the turn never
+     * finished; the stop button's abort never reached it). When the blackhole
+     * path never handed us a single callback there is no failure to read, so
+     * the sentinel synthesizes the response-error the handler owes (and aborts
+     * any controller it did see) — fetch rejects at once, pi-ai turns that
+     * into an error event, and the adapter's rotate loop gets to move the
+     * session to a live exit.
+     *
+     * Injection belongs here and nowhere else. A real `onResponseError` means
+     * undici already reported the failure to us, so forwarding it is enough;
+     * racing it with a synthesized one only loses the original.
+     */
+    const sentinelTeardown = (): void => {
+      if (!recordTransport()) return
       const reason = new Error('opencode2dsh: exit response silence')
       if (typeof handler.onResponseError === 'function') {
         ;(handler.onResponseError as (c: unknown, e: Error) => void).call(handler, liveController ?? ({} as never), reason)
@@ -472,7 +530,7 @@ export class PoolRoutingDispatcher implements RoutingDispatcherSurface {
     const armSentinel = (): void => {
       clearTimeout(sentinel)
       const window = sawRequestStart ? this.#headersMs : this.#sentinelMs
-      sentinel = setTimeout(classifyTransport, window)
+      sentinel = setTimeout(sentinelTeardown, window)
       sentinel.unref?.()
     }
     let sawRequestStart = false
@@ -513,7 +571,8 @@ export class PoolRoutingDispatcher implements RoutingDispatcherSurface {
       onResponseError: (controller, error) => {
         liveController = controller
         disarm()
-        classifyTransport()
+        // Bookkeeping only: the real error below is what the handler must see.
+        recordTransport()
         forward('onResponseError', [controller, error])
       },
       onResponseStarted: () => {
